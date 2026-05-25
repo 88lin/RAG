@@ -33,6 +33,26 @@ def get_float(key: str, default: float) -> float:
     except ValueError:
         return default
 
+PLACEHOLDER_VALUES = {
+    "",
+    "your-api-key-here",
+    "sk-your-openai-api-key-here",
+    "sk-your-openai-key",
+    "sk-your-openai-key-here",
+    "sk-ant-your-anthropic-api-key-here",
+    "your-zhipu-api-key-here",
+    "your-zhipu-api-key",
+    "your-key",
+    "sk-your-qwen-api-key-here",
+}
+
+def has_real_secret(value: str | None) -> bool:
+    """检查密钥是否不是空值或示例占位符。"""
+    if value is None:
+        return False
+    normalized = value.strip()
+    return bool(normalized) and normalized.lower() not in PLACEHOLDER_VALUES
+
 # ============================================================
 # 项目路径配置（不可变）
 # ============================================================
@@ -147,19 +167,19 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "zhipu")
 # OpenAI 配置
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 # Anthropic Claude 配置
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
 # 智谱AI 配置
 ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY", "")
-ZHIPU_MODEL = os.getenv("ZHIPU_MODEL", "glm-4")
+ZHIPU_MODEL = os.getenv("ZHIPU_MODEL", "glm-4-flash-250414")
 
 # 通义千问 配置
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
-QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-turbo")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen3.6-plus")
 
 # LLM 生成参数
 LLM_TEMPERATURE = get_float("LLM_TEMPERATURE", 0.5)   # RAG场景偏低更好
@@ -340,7 +360,7 @@ USE_GPU = False
 # ============================================================
 # 文档处理配置（固定值）
 # ============================================================
-SUPPORTED_FILE_TYPES = [".md", ".txt", ".pdf"]
+SUPPORTED_FILE_TYPES = [".md", ".txt", ".pdf", ".docx"]
 ENCODING = "utf-8"
 
 # ============================================================
@@ -356,13 +376,13 @@ def validate_config():
     errors = []
 
     # 检查 LLM API Key
-    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
+    if LLM_PROVIDER == "openai" and not has_real_secret(OPENAI_API_KEY):
         errors.append("OPENAI_API_KEY 未设置")
-    elif LLM_PROVIDER == "anthropic" and not ANTHROPIC_API_KEY:
+    elif LLM_PROVIDER == "anthropic" and not has_real_secret(ANTHROPIC_API_KEY):
         errors.append("ANTHROPIC_API_KEY 未设置")
-    elif LLM_PROVIDER == "zhipu" and not ZHIPU_API_KEY:
+    elif LLM_PROVIDER == "zhipu" and not has_real_secret(ZHIPU_API_KEY):
         errors.append("ZHIPU_API_KEY 未设置")
-    elif LLM_PROVIDER == "qwen" and not QWEN_API_KEY:
+    elif LLM_PROVIDER == "qwen" and not has_real_secret(QWEN_API_KEY):
         errors.append("QWEN_API_KEY 未设置")
 
     # 检查参数合理性

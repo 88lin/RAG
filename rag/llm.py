@@ -56,7 +56,19 @@ class LLMClient:
 
         # 2. 验证 API Key 是否存在
         api_key = self.config.get("api_key")
-        if not api_key or api_key == "your-api-key-here":
+        placeholder_values = {
+            "your-api-key-here",
+            "sk-your-openai-api-key-here",
+            "sk-your-openai-key",
+            "sk-your-openai-key-here",
+            "sk-ant-your-anthropic-api-key-here",
+            "your-zhipu-api-key-here",
+            "your-zhipu-api-key",
+            "your-key",
+            "your-key-here",
+            "sk-your-qwen-api-key-here",
+        }
+        if not api_key or api_key.strip().lower() in placeholder_values:
             raise ValueError(
                 f"未配置 API Key\n"
                 f"请在 .env 文件中设置 {self.provider.upper()}_API_KEY"
