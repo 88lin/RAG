@@ -43,6 +43,7 @@ export function useChat(logs: Ref<LogEntry[]>, onCitationsReceived?: (chunkIds: 
     currentAiMessage = '';
     currentMessageId = `msg-${Date.now()}-ai`;
     currentSimilarity.value = 0;  // 每次新消息重置相似度
+    lastPrompt.value = null;
 
     // 添加空 AI 消息占位
     messages.value.push({
