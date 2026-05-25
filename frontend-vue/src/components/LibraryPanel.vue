@@ -23,7 +23,7 @@
         <input
           type="file"
           multiple
-          accept=".pdf,.txt,.md,.docx"
+          accept=".md,.txt,.pdf,.docx"
           class="hidden"
           @change="handleFileSelect"
           :disabled="isUploading"
