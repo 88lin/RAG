@@ -405,7 +405,7 @@ class Retriever:
                 from sentence_transformers import CrossEncoder
                 logger.info(f"加载 Rerank 模型: {RERANK_MODEL}")
                 self._reranker = CrossEncoder(RERANK_MODEL)
-                logger.info("✓ Rerank 模型加载完成")
+                logger.info("Rerank 模型加载完成")
             except ImportError:
                 logger.warning(
                     f"缺少依赖库 sentence-transformers，Rerank 重排序将不可用\n"
@@ -540,7 +540,7 @@ class Retriever:
                 self._bm25_index = BM25Okapi(tokenized_docs)
                 self._bm25_doc_count = current_count
 
-                logger.info(f"✓ BM25 索引构建完成（{len(documents)} 个文档）")
+                logger.info(f"BM25 索引构建完成（{len(documents)} 个文档）")
 
             except ImportError as e:
                 logger.warning(
@@ -675,8 +675,6 @@ class Retriever:
         # 原因：相对归一化会让所有不相关文档中的"最好"文档得到高分
         vector_scores = {}
         if vector_results:
-            logger.info(f"🔧 使用修复后的代码处理 {len(vector_results)} 个向量结果")
-
             for r in vector_results:
                 doc_id = r.get('id', r['document'][:50])
                 distance = r.get('distance') or 0  # 修复：确保不会是 None

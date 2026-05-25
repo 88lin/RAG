@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DeepBlue Intelligence API",
-    description="RAG交互系统后端API - 六边形架构适配层\n\n速率限制：每IP每分钟10次请求",
+    description="RAG交互系统后端API - 六边形架构适配层\n\n速率限制：每IP每分钟30次请求",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",

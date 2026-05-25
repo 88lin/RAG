@@ -5,7 +5,8 @@
 
 import time
 from collections import defaultdict, deque
-from fastapi import Request, HTTPException, status
+from fastapi import Request, status
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
@@ -27,11 +28,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         # 系统端点不限流
-        if request.url.path in ["/", "/health", "/docs", "/redoc", "/openapi.json"]:
+        if request.method == "OPTIONS" or request.url.path in ["/", "/health", "/docs", "/redoc", "/openapi.json"]:
             return await call_next(request)
 
         # 获取客户端IP
-        client_ip = request.client.host
+        forwarded_for = request.headers.get("x-forwarded-for", "")
+        client_ip = (
+            forwarded_for.split(",")[0].strip()
+            or (request.client.host if request.client else "unknown")
+        )
 
         # 当前时间
         now = time.time()
@@ -47,9 +52,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             oldest_request = request_times[0]
             wait_time = int(self.window_seconds - (now - oldest_request))
 
-            raise HTTPException(
+            return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail={
+                content={
                     "error": "Rate limit exceeded",
                     "message": f"Too many requests. Limit: {self.requests_per_minute} requests per minute.",
                     "retry_after": wait_time,
