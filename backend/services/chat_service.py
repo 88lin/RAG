@@ -243,7 +243,13 @@ class ChatService:
                 # 2.5 检索结果详情
                 result_details = []
                 for i, r in enumerate(results[:5], 1):  # 只推送前5个
-                    distance = r.get('distance', 1.0)
+                    raw_distance = r.get('distance')
+                    try:
+                        distance = float(raw_distance) if raw_distance is not None else None
+                    except (TypeError, ValueError):
+                        distance = None
+                    distance_for_score = distance if distance is not None else 1.0
+                    distance = distance_for_score
                     # 优先级：rerank_score > hybrid_score > 1-distance
                     # 因为 rerank 是在 hybrid 基础上交叉编码器精排，最准确
                     best_score = (
