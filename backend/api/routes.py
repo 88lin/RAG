@@ -129,22 +129,49 @@ async def list_documents(include_chunks: bool = False):
             # 只获取元数据（不含文档内容）
             results = collection.get(include=["metadatas"])
 
-            documents_list = []
-            seen_files = set()
+            documents_map = {}
             for metadata in results.get("metadatas", []):
                 file = metadata.get("file", "unknown")
-                if file not in seen_files:
-                    documents_list.append(DocumentInfo(
-                        file=file,
-                        category=metadata.get("category", "unknown"),
-                        chunks=None
-                    ))
-                    seen_files.add(file)
+                if file not in documents_map:
+                    documents_map[file] = {
+                        "file": file,
+                        "category": metadata.get("category", "unknown"),
+                        "chunks": None,
+                        "chunk_count": 0
+                    }
+                documents_map[file]["chunk_count"] += 1
+
+            documents_list = [
+                DocumentInfo(**document)
+                for document in documents_map.values()
+            ]
 
         return DocumentListResponse(documents=documents_list, total=len(documents_list))
 
     except Exception as e:
         logger.error(f"获取文档列表错误: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/documents/{file_name:path}/chunks", response_model=list[ChunkInfo], summary="获取文档切片")
+async def get_document_chunks(file_name: str):
+    """按需获取指定文档的切片内容。"""
+    try:
+        vectordb = VectorDB()
+        collection = vectordb.get_collection()
+        results = collection.get(
+            where={"file": file_name},
+            include=["documents", "metadatas"]
+        )
+
+        ids = results.get("ids", []) or []
+        documents = results.get("documents", []) or []
+        return [
+            ChunkInfo(id=chunk_id, content=content or "", index=index)
+            for index, (chunk_id, content) in enumerate(zip(ids, documents))
+        ]
+    except Exception as e:
+        logger.error(f"获取文档切片错误: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

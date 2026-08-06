@@ -67,7 +67,7 @@
           >
             <div class="text-sm font-semibold truncate text-slate-200">{{ file.name }}</div>
             <div class="text-xs text-slate-500 font-mono">
-              <span>{{ file.chunks.length }} 片段</span>
+              <span>{{ file.chunkCount ?? file.chunks.length }} 片段</span>
             </div>
           </div>
 
@@ -108,7 +108,11 @@
           class="border-t border-deep-800 bg-black/20 p-2 space-y-1"
         >
           <div class="text-xs uppercase text-slate-500 font-mono mb-2 px-1">文档片段</div>
+          <div v-if="!file.chunksLoaded" class="text-xs p-2 text-slate-500 font-mono">
+            加载中...
+          </div>
           <div
+            v-else
             v-for="(chunk, idx) in file.chunks"
             :key="chunk.id"
             :class="[
@@ -141,6 +145,7 @@ interface Props {
 
 interface Emits {
   (e: 'toggleFile', id: string): void;
+  (e: 'expandFile', id: string): void;
   (e: 'upload', files: File[]): void;
   (e: 'deleteFile', fileName: string): void;
 }
@@ -159,6 +164,7 @@ const toggleExpand = (id: string) => {
     expandedFileIds.value.delete(id);
   } else {
     expandedFileIds.value.add(id);
+    emit('expandFile', id);
   }
   // 触发响应式更新
   expandedFileIds.value = new Set(expandedFileIds.value);

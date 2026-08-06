@@ -191,15 +191,15 @@ async def upload_documents_stream(files: List[UploadFile] = File(...)):
 
     async def event_generator():
         """SSE 事件生成器"""
-        ingestion = get_ingestion()
-        adapter = StreamingIngestionAdapter(ingestion)
-
         total_files = len(file_data)
         processed_count = 0
         failed_count = 0
 
         # 发送开始事件
         yield f"data: {json.dumps({'type': 'upload_start', 'data': {'total_files': total_files}})}\n\n"
+
+        ingestion = get_ingestion()
+        adapter = StreamingIngestionAdapter(ingestion)
 
         for file_index, fd in enumerate(file_data, 1):
             filename = fd["filename"]

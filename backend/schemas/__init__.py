@@ -44,6 +44,7 @@ class DocumentInfo(BaseModel):
     file: str = Field(..., description="文件名")
     category: str = Field(..., description="分类")
     chunks: Optional[List[ChunkInfo]] = Field(None, description="文档切片列表（可选）")
+    chunk_count: Optional[int] = Field(None, description="文档切片数量")
 
 class CitationInfo(BaseModel):
     """引用信息"""

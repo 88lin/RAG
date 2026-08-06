@@ -14,6 +14,8 @@ export interface KnowledgeFile {
   size: string;
   isEnabled: boolean;
   chunks: Chunk[];
+  chunkCount: number;
+  chunksLoaded: boolean;
   description: string;
   uploadTime?: string;
 }
@@ -99,6 +101,7 @@ export interface BackendDocument {
   file: string;
   category: string;
   chunks?: BackendChunkInfo[];  // 可选的切片列表
+  chunk_count?: number;
 }
 
 // 后端文档列表响应

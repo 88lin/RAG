@@ -16,12 +16,11 @@ export function useDocuments(logs: Ref<LogEntry[]>) {
   const { eventToLog, updateStatusFromEvent } = useSSEStream();
 
   /**
-   * 加载文档列表（包含切片详情）
+   * 加载文档列表
    */
   const loadDocuments = async () => {
     try {
-      // 调用带 include_chunks=true 的 API
-      const response: BackendDocumentListResponse = await apiService.getDocuments(true);
+      const response: BackendDocumentListResponse = await apiService.getDocuments(false);
 
       // 转换为前端格式
       files.value = response.documents.map((doc, index) => {
@@ -41,6 +40,8 @@ export function useDocuments(logs: Ref<LogEntry[]>) {
             content: chunk?.content || '',
             sourceId: fileName
           })),
+          chunkCount: doc.chunk_count ?? chunks.length,
+          chunksLoaded: Array.isArray(doc.chunks),
           description: `Category: ${doc.category || 'unknown'}`,
           uploadTime: new Date().toISOString() // 后端没有返回时间
         };
@@ -51,7 +52,7 @@ export function useDocuments(logs: Ref<LogEntry[]>) {
         timestamp: Date.now(),
         type: 'success',
         stage: 'SYS',
-        message: `Loaded ${response.total} documents with ${files.value.reduce((sum, f) => sum + f.chunks.length, 0)} chunks`
+        message: `Loaded ${response.total} documents with ${files.value.reduce((sum, f) => sum + f.chunkCount, 0)} chunks`
       });
     } catch (error) {
       console.error('Failed to load documents:', error);
@@ -61,6 +62,31 @@ export function useDocuments(logs: Ref<LogEntry[]>) {
         type: 'error',
         stage: 'SYS',
         message: `Failed to load documents: ${error}`
+      });
+    }
+  };
+
+  const loadDocumentChunks = async (fileId: string) => {
+    const file = files.value.find(item => item.id === fileId);
+    if (!file || file.chunksLoaded) return;
+
+    try {
+      const chunks = await apiService.getDocumentChunks(file.name);
+      file.chunks = chunks.map(chunk => ({
+        id: chunk.id,
+        content: chunk.content || '',
+        sourceId: file.name
+      }));
+      file.chunkCount = chunks.length;
+      file.chunksLoaded = true;
+    } catch (error) {
+      console.error('Failed to load document chunks:', error);
+      logs.value.push({
+        id: `log-${Date.now()}`,
+        timestamp: Date.now(),
+        type: 'error',
+        stage: 'SYS',
+        message: `Failed to load document chunks: ${error}`
       });
     }
   };
@@ -208,6 +234,7 @@ export function useDocuments(logs: Ref<LogEntry[]>) {
     uploadDocuments,
     deleteDocument,
     loadDocuments,
+    loadDocumentChunks,
     setHighlightedChunks,
     clearHighlights
   };

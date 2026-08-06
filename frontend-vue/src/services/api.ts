@@ -1,5 +1,5 @@
 import { API_BASE_URL } from '@/constants';
-import type { BackendDocumentListResponse, SSEEvent } from '@/types';
+import type { BackendChunkInfo, BackendDocumentListResponse, SSEEvent } from '@/types';
 
 // API 服务类
 class ApiService {
@@ -23,6 +23,16 @@ class ApiService {
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch documents: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  async getDocumentChunks(fileName: string): Promise<BackendChunkInfo[]> {
+    const response = await fetch(
+      `${this.baseUrl}/documents/${encodeURIComponent(fileName)}/chunks`
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch document chunks: ${response.statusText}`);
     }
     return response.json();
   }

@@ -49,7 +49,9 @@ export const SCENARIO_FILES: KnowledgeFile[] = [
     chunks: [
       { id: 'c-1-1', sourceId: 'demo-1', content: 'General hygiene: Wash hands frequently to prevent infection spread.' },
       { id: 'c-1-2', sourceId: 'demo-1', content: MEDICAL_GUIDE_TEXT.trim() }
-    ]
+    ],
+    chunkCount: 2,
+    chunksLoaded: true
   }
 ];
 

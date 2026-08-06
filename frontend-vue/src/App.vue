@@ -10,6 +10,7 @@
           :is-uploading="isUploading"
           :upload-progress="uploadProgress"
           @toggle-file="toggleFile"
+          @expand-file="loadDocumentChunks"
           @upload="handleUpload"
           @delete-file="handleDeleteFile"
         />
@@ -74,6 +75,7 @@ const {
   toggleFile,
   uploadDocuments,
   deleteDocument,
+  loadDocumentChunks,
   setHighlightedChunks,
   clearHighlights
 } = useDocuments(logs);
