@@ -110,7 +110,7 @@ if %RETRY_COUNT% geq %MAX_RETRIES% (
     exit /b 1
 )
 
-curl -f http://localhost:8000/api/health >nul 2>&1
+curl -f http://localhost:8000/health >nul 2>&1
 if %errorlevel% equ 0 (
     echo ✓ 后端服务已就绪
     goto check_frontend
@@ -122,7 +122,7 @@ timeout /t 2 /nobreak >nul
 goto wait_backend
 
 :check_frontend
-curl -f http://localhost:3000/health >nul 2>&1
+curl -f http://localhost:80/health >nul 2>&1
 if %errorlevel% equ 0 (
     echo ✓ 前端服务已就绪
 ) else (

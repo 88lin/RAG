@@ -124,7 +124,7 @@ MAX_RETRIES=30
 RETRY_COUNT=0
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if curl -f http://localhost:8000/api/health >/dev/null 2>&1; then
+    if curl -f http://localhost:8000/health >/dev/null 2>&1; then
         print_success "后端服务已就绪"
         break
     fi
@@ -141,7 +141,7 @@ if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
 fi
 
 # 等待前端启动
-if curl -f http://localhost:3000/health >/dev/null 2>&1; then
+if curl -f http://localhost:80/health >/dev/null 2>&1; then
     print_success "前端服务已就绪"
 else
     print_info "前端服务正在启动中..."
