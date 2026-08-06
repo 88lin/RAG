@@ -183,6 +183,45 @@ class VectorDB:
 
         self.collection.delete(ids=ids, where=where)
 
+    def get_neighbors(self, doc_key: str, seq: int, window: int = 1) -> List[Dict]:
+        """取同一文档中指定 chunk 的相邻切片（不含自身）。
+
+        用途：分块会在语义中间切断，命中第 n 块时答案后半句可能落在第 n+1 块。
+        Chroma 的 where 只能过滤 metadata，无法对 id 做前缀或范围查询，
+        因此依赖摄入时写入的 doc_key / seq 字段。
+
+        参数:
+            doc_key: str - 文档标识（等于 metadata 中的 doc_key）
+            seq: int - 中心 chunk 的序号
+            window: int - 向前后各取多少块
+
+        返回:
+            List[Dict] - 按 seq 升序，每项含 id / document / metadata。
+                         越界的序号自动跳过，不报错。
+        """
+        if self.collection is None:
+            self.get_collection()
+
+        wanted = [s for s in range(seq - window, seq + window + 1) if s >= 0 and s != seq]
+        if not wanted:
+            return []
+
+        results = self.collection.get(
+            where={"$and": [{"doc_key": doc_key}, {"seq": {"$in": wanted}}]},
+            include=["documents", "metadatas"],
+        )
+
+        neighbors = [
+            {"id": cid, "document": doc, "metadata": meta}
+            for cid, doc, meta in zip(
+                results.get("ids", []) or [],
+                results.get("documents", []) or [],
+                results.get("metadatas", []) or [],
+            )
+        ]
+        neighbors.sort(key=lambda item: item["metadata"].get("seq", 0))
+        return neighbors
+
     def delete_by_file(self, file_name: str) -> int:
         """删除某个源文件对应的所有切片，返回删除数量。"""
         if self.collection is None:

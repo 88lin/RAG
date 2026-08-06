@@ -98,14 +98,27 @@ class DocumentIngestion:
         if not chunk_pairs:
             return 0
 
-        # 2. 向量化（只传文本部分）
+        # 2. 向量化（文档侧编码，不加查询前缀）
         chunks = [pair[0] for pair in chunk_pairs]
-        embeddings = self.embedder.encode(chunks, to_list=True)
+        embeddings = self.embedder.encode_documents(chunks, to_list=True)
 
-        # 3. 准备数据：base 元数据 + 每块的 header 元数据合并
+        # 3. 准备数据：base 元数据 + 每块的 header 元数据 + 定位元数据
+        # doc_key / seq / total_chunks 必须进 metadata：Chroma 的 where 只能查
+        # metadata，无法对 id 做前缀或范围查询，因此"取同文档相邻 chunk"
+        # （用于跨越分块边界补全被切断的语义）依赖这三个字段。
         base_meta = metadata or {}
-        ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
-        metadatas = [{**base_meta, **pair[1]} for pair in chunk_pairs]
+        total = len(chunks)
+        ids = [f"{doc_id}_chunk_{i}" for i in range(total)]
+        metadatas = [
+            {
+                **base_meta,
+                **pair[1],
+                "doc_key": doc_id,
+                "seq": i,
+                "total_chunks": total,
+            }
+            for i, pair in enumerate(chunk_pairs)
+        ]
 
         # 4. 入库
         if replace_existing and base_meta.get("file"):
@@ -137,14 +150,14 @@ class DocumentIngestion:
 
         # 检查文件类型
         if file_path.suffix.lower() not in SUPPORTED_FILE_TYPES:
-            print(f"⚠ 跳过不支持的文件类型: {file_path}")
+            print(f"[warn] 跳过不支持的文件类型: {file_path}")
             return 0
 
         # 读取文件
         try:
             content = read_document_file(file_path)
         except Exception as e:
-            print(f"✗ 读取文件失败 {file_path}: {e}")
+            print(f"[!!] 读取文件失败 {file_path}: {e}")
             return 0
 
         # 准备元数据，上传临时文件时使用原始文件名。
@@ -216,14 +229,14 @@ class DocumentIngestion:
 
                         try:
                             chunks = self.ingest_file(str(file_path), category)
-                            print(f" ({chunks} chunks) ✓")
+                            print(f" ({chunks} chunks) [OK]")
 
                             file_count += 1
                             chunk_count += chunks
                             stats["success_files"] += 1
 
                         except Exception as e:
-                            print(f" ✗ 失败: {e}")
+                            print(f" [!!] 失败: {e}")
                             stats["failed_files"] += 1
 
                 stats["total_files"] += file_count
@@ -244,7 +257,7 @@ class DocumentIngestion:
                         stats["success_files"] += 1
                         stats["total_chunks"] += chunks
                     except Exception as e:
-                        print(f"✗ 处理失败 {file_path.name}: {e}")
+                        print(f"[!!] 处理失败 {file_path.name}: {e}")
                         stats["failed_files"] += 1
 
             stats["total_files"] = stats["success_files"] + stats["failed_files"]
@@ -253,14 +266,14 @@ class DocumentIngestion:
         print("\n" + "=" * 70)
         print("摄入完成！")
         print("=" * 70)
-        print(f"  • 处理文件数: {stats['total_files']}")
-        print(f"  • 成功: {stats['success_files']}, 失败: {stats['failed_files']}")
-        print(f"  • 生成块数: {stats['total_chunks']}")
+        print(f"  - 处理文件数: {stats['total_files']}")
+        print(f"  - 成功: {stats['success_files']}, 失败: {stats['failed_files']}")
+        print(f"  - 生成块数: {stats['total_chunks']}")
 
         if stats['categories']:
             print(f"\n按类别统计:")
             for cat, cat_stats in stats['categories'].items():
-                print(f"  • {cat}: {cat_stats['files']} 文件, {cat_stats['chunks']} 块")
+                print(f"  - {cat}: {cat_stats['files']} 文件, {cat_stats['chunks']} 块")
 
         print(f"\n数据库总文档数: {self.vectordb.count()}")
 
@@ -302,9 +315,9 @@ if __name__ == "__main__":
         metadata={"category": "test", "file": "sample.md"}
     )
 
-    print(f"✓ 文本摄入完成，生成 {chunk_count} 个块")
+    print(f"[OK] 文本摄入完成，生成 {chunk_count} 个块")
 
     # 查看数据库状态
     print(f"\n数据库文档数: {ingestion.vectordb.count()}")
 
-    print("\n✓ 测试完成")
+    print("\n[OK] 测试完成")

@@ -181,7 +181,7 @@ class StreamingIngestionAdapter:
             all_embeddings = []
             for i in range(0, chunk_count, batch_size):
                 batch_chunks = chunks[i:i + batch_size]
-                batch_embeddings = self.ingestion.embedder.encode(
+                batch_embeddings = self.ingestion.embedder.encode_documents(
                     batch_chunks,
                     to_list=True
                 )
@@ -222,11 +222,20 @@ class StreamingIngestionAdapter:
 
             await asyncio.sleep(0)
 
-            # 准备数据：base 元数据 + 每块的 header 元数据合并
+            # 准备数据：base 元数据 + 每块的 header 元数据 + 定位元数据
+            # doc_key / seq / total_chunks 与 ingestion.ingest_text 保持一致，
+            # 两条摄入路径（同步、流式）写入的 metadata 结构必须相同。
             doc_id = build_document_id(filename, category)
             ids = [f"{doc_id}_chunk_{i}" for i in range(chunk_count)]
             metadatas = [
-                {"file": filename, "category": category, **chunk_metas[i]}
+                {
+                    "file": filename,
+                    "category": category,
+                    **chunk_metas[i],
+                    "doc_key": doc_id,
+                    "seq": i,
+                    "total_chunks": chunk_count,
+                }
                 for i in range(chunk_count)
             ]
 
