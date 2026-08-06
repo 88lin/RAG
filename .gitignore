@@ -74,13 +74,16 @@ data/documents/
 .DS_Store
 Thumbs.db
 nul
+tmp/
+.tmp/
 
 # 废弃代码
 old_*.py
 frontend/
 frontend_reference/
-test_*.py
-test_*.html
+# 只忽略仓库根目录的临时测试脚本，tests/ 下的正式测试要提交
+/test_*.py
+/test_*.html
 
 # Jupyter Notebook
 .ipynb_checkpoints
