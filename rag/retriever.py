@@ -9,25 +9,23 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from .vectordb import VectorDB
 from .embedder import Embedder
+from .scoring import compute_relevance, rrf_fuse
 from config import (
     TOP_K_RESULTS,
-    RETRIEVAL_DISTANCE_THRESHOLD,
+    RETRIEVAL_MIN_RELEVANCE,
     ENABLE_THRESHOLD_FILTERING,
     ENABLE_AUTO_CLASSIFICATION,
     CATEGORY_KEYWORDS,
     RETRIEVAL_MODE,
-    # ENABLE_QUERY_REWRITE,  # 已删除（Phase 1 优化）
     ENABLE_MULTI_QUERY,
     NUM_EXPANDED_QUERIES,
-    # QUERY_REWRITE_PROMPT,  # 已删除（Phase 1 优化）
     MULTI_QUERY_PROMPT,
     ENABLE_RERANK,
     RERANK_TOP_K,
     RERANK_MODEL,
     ENABLE_HYBRID,
-    BM25_WEIGHT,
-    VECTOR_WEIGHT,
-    HYBRID_TOP_K
+    HYBRID_TOP_K,
+    RRF_K,
 )
 from typing import List, Dict, Optional, TYPE_CHECKING
 from .logger import get_logger
@@ -82,8 +80,8 @@ class Retriever:
         if top_k is None:
             top_k = TOP_K_RESULTS
 
-        # 1. 将查询转换为向量
-        query_embedding = self.embedder.encode(query, to_list=True)
+        # 1. 将查询转换为向量（查询侧编码，bge 中文模型会加指令前缀）
+        query_embedding = self.embedder.encode_query(query, to_list=True)
 
         # 2. 构建过滤条件
         where = {"category": category_filter} if category_filter else None
@@ -96,19 +94,31 @@ class Retriever:
         )
 
         # 4. 格式化结果
+        #    统一写入 cosine_distance 与 relevance 两个字段：
+        #    - cosine_distance 是 Chroma 原始距离，可能缺失或为 None
+        #    - relevance 由 rag.scoring 统一计算，恒在 [0,1]，越大越相关
+        #    distance 保留为旧字段别名，供尚未迁移的调试脚本使用。
         formatted_results = []
+        distances = results.get('distances') or []
+        has_distances = bool(distances) and distances[0] is not None
+
         for i in range(len(results['ids'][0])):
             result = {
                 'id': results['ids'][0][i],
                 'document': results['documents'][0][i],
                 'metadata': results['metadatas'][0][i],
             }
-            # 添加距离信息（如果有）
-            # 修复：确保 distance 不会是 None，ChromaDB 有时返回 None 值
-            if 'distances' in results and results['distances']:
-                distance_value = results['distances'][0][i]
-                result['distance'] = distance_value if distance_value is not None else 0.0
 
+            if has_distances:
+                raw = distances[0][i]
+                # 不把缺失值伪造成 0.0（那等价于"完全匹配"），保持 None 让
+                # compute_relevance 判定为"无相关性信息"。
+                result['cosine_distance'] = raw if isinstance(raw, (int, float)) else None
+            else:
+                result['cosine_distance'] = None
+
+            result['distance'] = result['cosine_distance']
+            result['relevance'] = compute_relevance(result)
             formatted_results.append(result)
 
         return formatted_results
@@ -196,35 +206,38 @@ class Retriever:
         self,
         query: str,
         top_k: int = None,
-        threshold: float = None,
+        min_relevance: float = None,
         category_filter: Optional[str] = None
     ) -> List[Dict]:
         """
-        带分数阈值过滤的检索
+        带相关性阈值过滤的检索
 
         参数:
             query: str - 用户查询
             top_k: int - 返回结果数量（默认使用 TOP_K_RESULTS）
-            threshold: float - 距离阈值（默认使用 RETRIEVAL_DISTANCE_THRESHOLD）
+            min_relevance: float - 最低相关性（默认 RETRIEVAL_MIN_RELEVANCE），
+                                   口径为 relevance ∈ [0,1] 越大越好
             category_filter: str - 类别过滤（可选）
 
         返回:
             List[Dict] - 过滤后的检索结果列表
         """
-        # 使用默认值
         if top_k is None:
             top_k = TOP_K_RESULTS
-        if threshold is None:
-            threshold = RETRIEVAL_DISTANCE_THRESHOLD
+        if min_relevance is None:
+            min_relevance = RETRIEVAL_MIN_RELEVANCE
 
         # 1. 检索更多候选（2倍）以确保过滤后仍有足够结果
         candidate_k = top_k * 2
         results = self.retrieve(query, top_k=candidate_k, category_filter=category_filter)
 
-        # 2. 过滤低质量结果
-        filtered = [r for r in results if (r.get('distance') or 999) < threshold]
+        # 2. 过滤低相关结果
+        filtered = [r for r in results if r.get('relevance', 0.0) >= min_relevance]
 
-        logger.info(f"阈值过滤: {len(results)} -> {len(filtered)} (threshold={threshold})")
+        logger.info(
+            f"相关性过滤: {len(results)} -> {len(filtered)} "
+            f"(min_relevance={min_relevance})"
+        )
 
         # 3. 返回 top-k（宁缺毋滥，不放宽阈值）
         return filtered[:top_k]
@@ -372,18 +385,19 @@ class Retriever:
             for result in results:
                 doc_id = result['id']
 
-                # 如果已存在，保留距离更小的结果
-                if doc_id in all_results:
-                    # 修复：使用 or 确保 None 值被替换为默认值
-                    existing_distance = all_results[doc_id].get('distance') or 999
-                    new_distance = result.get('distance') or 999
-                    if new_distance < existing_distance:
-                        all_results[doc_id] = result
-                else:
+                # 同一 chunk 被多个查询变体命中时，保留相关性更高的那次
+                existing = all_results.get(doc_id)
+                if existing is None:
+                    all_results[doc_id] = result
+                elif result.get('relevance', 0.0) > existing.get('relevance', 0.0):
                     all_results[doc_id] = result
 
-        # 按距离排序（修复：确保 None 值被替换）
-        merged = sorted(all_results.values(), key=lambda x: x.get('distance') or 999)
+        # 按相关性降序（统一口径：越大越相关）
+        merged = sorted(
+            all_results.values(),
+            key=lambda x: x.get('relevance', 0.0),
+            reverse=True,
+        )
 
         logger.info(f"多查询合并: {len(queries)} 个查询 -> {len(merged)} 个去重结果")
 
@@ -456,15 +470,17 @@ class Retriever:
             # 准备输入对 [query, document]
             pairs = [[query, r['document']] for r in results]
 
-            # 重新打分（分数越高越相关）
+            # 重新打分。CrossEncoder 输出的是未过激活函数的 logit（可为负、
+            # 量级可达 ±11），不是 [0,1] 的分数，故字段名为 rerank_logit。
+            # sigmoid(logit) 才是模型估计的相关概率，由 compute_relevance 负责。
             scores = reranker.predict(pairs)
 
-            # 添加 rerank_score 到结果
             for i, result in enumerate(results):
-                result['rerank_score'] = float(scores[i])
+                result['rerank_logit'] = float(scores[i])
+                # rerank 覆盖向量距离得出的 relevance（精排结论优先）
+                result['relevance'] = compute_relevance(result)
 
-            # 按 rerank_score 降序排序
-            reranked = sorted(results, key=lambda x: x['rerank_score'], reverse=True)
+            reranked = sorted(results, key=lambda x: x['rerank_logit'], reverse=True)
 
             logger.info(f"Rerank: {len(results)} 个候选 -> Top-{top_k}")
 
@@ -479,12 +495,19 @@ class Retriever:
     # ============================================================
 
     def invalidate_bm25_cache(self):
-        """上传新文档后调用，强制下次检索时重建 BM25 索引"""
-        if hasattr(self, '_bm25_index'):
-            del self._bm25_index
-            del self._bm25_docs
-            del self._bm25_metadatas
-            del self._bm25_ids
+        """上传或删除文档后调用，强制下次检索时重建 BM25 索引。
+
+        逐个属性判断存在性：索引构建失败的路径上 _bm25_index 被设为 None
+        但 _bm25_docs 等可能未赋值，此前无条件 del 会抛 AttributeError，
+        使上传接口的缓存刷新静默失败。
+        """
+        cleared = False
+        for attr in ('_bm25_index', '_bm25_docs', '_bm25_metadatas',
+                     '_bm25_ids', '_bm25_doc_count'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+                cleared = True
+        if cleared:
             logger.info("BM25 索引缓存已清除，下次检索时重建")
 
     def _build_bm25_index(self):
@@ -618,42 +641,40 @@ class Retriever:
         self,
         query: str,
         top_k: int = None,
-        bm25_weight: float = None,
-        vector_weight: float = None,
         mode: Optional[str] = None
     ) -> List[Dict]:
         """
-        混合检索：结合向量检索和 BM25 关键词检索
+        混合检索：向量召回 + BM25 召回，用 RRF 融合排名
 
-        原理：
-        1. 向量检索：捕捉语义相似性（理解意图）
-        2. BM25 检索：捕捉关键词匹配（精确匹配）
-        3. 加权融合：综合两者优势
+        为什么用 RRF 而不是加权归一化：
+          向量的余弦距离与 BM25 的 TF-IDF 得分量纲不同，加权相加没有物理意义。
+          此前的实现里向量侧用绝对距离转换、BM25 侧用 score/max 相对归一化，
+          后者使"本批最好的"恒为 1.0（即使完全不相关），因此 0.7/0.3 是无效参数。
+          RRF 只用排名：score(d) = Σ 1/(k + rank_i(d))，BM25 原始分是 3.7 还是
+          3700 都不影响结果，无需归一化也无需调权重。
+
+        排序与展示分离：
+          rrf_score 只用于排序，量级约 0.016~0.033，无相关性语义；
+          relevance 由 rag.scoring.compute_relevance() 计算，用于展示与阈值判断。
 
         参数:
             query: str - 用户查询
             top_k: int - 最终返回数量
-            bm25_weight: float - BM25 权重（默认 0.3）
-            vector_weight: float - 向量权重（默认 0.7）
             mode: str - 检索模式
 
         返回:
-            List[Dict] - 混合检索结果列表
+            List[Dict] - 融合后的结果，含 rrf_score / relevance / bm25_score /
+                         cosine_distance / retrieved_by
         """
         if top_k is None:
             top_k = TOP_K_RESULTS
-        if bm25_weight is None:
-            bm25_weight = BM25_WEIGHT
-        if vector_weight is None:
-            vector_weight = VECTOR_WEIGHT
         if mode is None:
             mode = RETRIEVAL_MODE
 
-        # 获取更多候选（用于融合）
+        # 每路召回的候选数
         candidate_k = max(HYBRID_TOP_K, top_k * 2)
 
-        # Step 1: 向量检索
-        # 根据mode确定分类
+        # Step 1: 向量召回
         category_filter = None
         if mode == "keyword":
             category_filter = self._classify_query_by_keywords(query)
@@ -666,75 +687,59 @@ class Retriever:
             category_filter=category_filter
         )
 
-        # Step 2: BM25 检索
+        # Step 2: BM25 召回
         bm25_results = self._bm25_search(query, top_k=candidate_k)
 
-        # Step 3: 归一化分数并融合
-        # 归一化向量检索分数（距离转为相似度，范围 0-1）
-        # 🎯 最佳实践：使用绝对距离转换，而非相对归一化
-        # 原因：相对归一化会让所有不相关文档中的"最好"文档得到高分
-        vector_scores = {}
-        if vector_results:
-            for r in vector_results:
-                doc_id = r.get('id', r['document'][:50])
-                distance = r.get('distance') or 0  # 修复：确保不会是 None
-
-                # 使用绝对距离转换：distance 0-2 → score 1-0
-                # 余弦距离范围 [0, 2]，0 表示完全相同，2 表示完全相反
-                normalized_score = max(0.0, 1.0 - (distance / 2.0))
-                vector_scores[doc_id] = normalized_score
-
-        # 归一化 BM25 分数（范围 0-1）
-        bm25_scores = {}
-        if bm25_results:
-            # 修复：使用 or 0 确保 None 值被替换为 0
-            bm25_scores_list = [r.get('bm25_score') or 0 for r in bm25_results]
-            max_bm25 = max(bm25_scores_list) if bm25_scores_list else 0
-
-            for r in bm25_results:
-                doc_id = r.get('id', r['document'][:50])
-                bm25_score = r.get('bm25_score') or 0  # 修复：确保不会是 None
-                normalized_score = bm25_score / max_bm25 if max_bm25 > 0 else 0
-                bm25_scores[doc_id] = normalized_score
-
-        # Step 4: 加权融合
-        # 收集所有文档
-        all_docs = {}
-        for r in vector_results:
-            doc_id = r.get('id', r['document'][:50])
-            all_docs[doc_id] = r
-
+        # Step 3: 建立 id → 结果的索引。
+        # 两路都可能返回同一 chunk，向量侧的记录带 cosine_distance，优先保留；
+        # 只在 BM25 独有的 id 上取 BM25 的记录。
+        by_id: Dict[str, Dict] = {}
         for r in bm25_results:
-            doc_id = r.get('id', r['document'][:50])
-            if doc_id not in all_docs:
-                all_docs[doc_id] = r
+            by_id[r['id']] = r
+        for r in vector_results:
+            existing = by_id.get(r['id'])
+            merged = dict(r)
+            if existing is not None and existing.get('bm25_score') is not None:
+                merged['bm25_score'] = existing['bm25_score']
+            by_id[r['id']] = merged
 
-        # 计算混合分数
+        vector_ids = [r['id'] for r in vector_results]
+        bm25_ids = [r['id'] for r in bm25_results]
+        vector_id_set = set(vector_ids)
+        bm25_id_set = set(bm25_ids)
+
+        # Step 4: RRF 融合（只用排名）
+        fused = rrf_fuse(vector_ids, bm25_ids, k=RRF_K)
+
         hybrid_results = []
-        for doc_id, doc_data in all_docs.items():
-            v_score = vector_scores.get(doc_id, 0.0)
-            b_score = bm25_scores.get(doc_id, 0.0)
+        for doc_id, rrf_score in fused:
+            source = by_id.get(doc_id)
+            if source is None:
+                continue
 
-            # 加权混合
-            hybrid_score = (vector_weight * v_score) + (bm25_weight * b_score)
+            retrieved_by = []
+            if doc_id in vector_id_set:
+                retrieved_by.append('vector')
+            if doc_id in bm25_id_set:
+                retrieved_by.append('bm25')
 
-            result = {
-                'document': doc_data['document'],
-                'metadata': doc_data['metadata'],
+            hybrid_results.append({
                 'id': doc_id,
-                'hybrid_score': hybrid_score,
-                'vector_score': v_score,
-                'bm25_score': b_score,
-                'distance': doc_data.get('distance')  # 保留原始距离
-            }
-            hybrid_results.append(result)
+                'document': source['document'],
+                'metadata': source.get('metadata', {}),
+                'rrf_score': rrf_score,
+                # relevance 只反映语义相关度，与融合排名无关，供展示与阈值使用
+                'relevance': compute_relevance(source),
+                'cosine_distance': source.get('cosine_distance'),
+                'distance': source.get('cosine_distance'),
+                'bm25_score': source.get('bm25_score'),
+                'retrieved_by': retrieved_by,
+            })
 
-        # 按混合分数排序
-        hybrid_results = sorted(hybrid_results, key=lambda x: x['hybrid_score'], reverse=True)
-
+        both = len(vector_id_set & bm25_id_set)
         logger.info(
-            f"Hybrid 检索: {len(vector_results)} 个向量结果 + {len(bm25_results)} 个BM25结果 "
-            f"-> {len(hybrid_results)} 个融合结果 (权重: Vector={vector_weight}, BM25={bm25_weight})"
+            f"Hybrid(RRF k={RRF_K}): 向量 {len(vector_results)} 路 + BM25 "
+            f"{len(bm25_results)} 路 -> {len(hybrid_results)} 条（两路共同命中 {both} 条）"
         )
 
         return hybrid_results[:top_k]
@@ -860,46 +865,44 @@ class Retriever:
 
         stats["raw_results_count"] = len(results)
 
-        # Step 5: 阈值过滤
-        if enable_threshold:
-            threshold = RETRIEVAL_DISTANCE_THRESHOLD
-            if enable_hybrid:
-                # Hybrid 模式：用 hybrid_score 过滤（越大越好，阈值取补集）
-                # hybrid_score ∈ [0,1]，(1 - threshold) 作为最低可接受分数
-                min_hybrid_score = 1.0 - threshold
-                filtered = [r for r in results if r.get('hybrid_score', 0) >= min_hybrid_score]
-                if len(filtered) < 2 and len(results) > 0:
-                    filtered = [r for r in results if r.get('hybrid_score', 0) >= min_hybrid_score * 0.6]
-                    stats["threshold_relaxed"] = True
-                else:
-                    stats["threshold_relaxed"] = False
-            else:
-                # 纯向量模式：用 distance 过滤（越小越好）
-                filtered = [r for r in results if (r.get('distance') or 999) < threshold]
-                if len(filtered) < 2 and len(results) > 0:
-                    relaxed_threshold = threshold * 1.5
-                    filtered = [r for r in results if (r.get('distance') or 999) < relaxed_threshold]
-                    stats["threshold_relaxed"] = True
-                else:
-                    stats["threshold_relaxed"] = False
-
-            results = filtered
-            stats["filtered_results_count"] = len(results)
-
-        # Step 6: Rerank 精排序（阶段3）
+        # Step 5: Rerank 精排序
+        # 顺序说明：rerank 必须在阈值过滤之前。
+        # rerank 的价值就是修正粗排的错误顺序，若先按粗排分数过滤，
+        # 被粗排低估的正确文档就没有机会被精排救回来。
         if enable_rerank:
-            # 获取更多候选用于精排
             candidate_k = min(RERANK_TOP_K, len(results))
             if candidate_k > 0:
                 rerank_candidates = results[:candidate_k]
-                results = self._rerank_results(query, rerank_candidates, top_k=top_k)
+                # 精排阶段保留全部候选，过滤交给 Step 6 按统一口径处理
+                results = self._rerank_results(
+                    query, rerank_candidates, top_k=candidate_k
+                )
                 stats["rerank_candidates"] = candidate_k
             else:
                 stats["rerank_candidates"] = 0
 
+        # Step 6: 相关性过滤（统一口径：relevance ∈ [0,1] 越大越好）
+        # 不设"结果太少就放宽阈值"的兜底：那会让知识库中确实没有答案的问题
+        # 也返回勉强凑数的结果，直接破坏无答案识别能力。宁缺毋滥。
+        if enable_threshold:
+            min_relevance = RETRIEVAL_MIN_RELEVANCE
+            before = len(results)
+            results = [
+                r for r in results
+                if r.get('relevance', compute_relevance(r)) >= min_relevance
+            ]
+            stats["min_relevance"] = min_relevance
+            stats["filtered_results_count"] = len(results)
+            logger.info(
+                f"相关性过滤: {before} -> {len(results)} (min_relevance={min_relevance})"
+            )
+
         # 限制返回数量
         final_results = results[:top_k]
         stats["final_results_count"] = len(final_results)
+        stats["top_relevance"] = (
+            final_results[0].get('relevance') if final_results else None
+        )
 
         return {
             "results": final_results,

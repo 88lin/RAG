@@ -9,16 +9,68 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from config import (
     LLM_PROVIDER, SYSTEM_PROMPT, QUERY_TEMPLATE, NO_CONTEXT_TEMPLATE,
-    LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_TIMEOUT, SIMILARITY_THRESHOLD,
+    LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_TIMEOUT,
+    ANSWERABLE_MIN_RELEVANCE, RETRIEVAL_MIN_RELEVANCE,
     get_llm_config
 )
-from typing import Optional, List, Dict, Iterator
+from typing import Optional, List, Dict, Iterator, Tuple
 import time
 import functools
 from .logger import get_logger
+from .scoring import compute_relevance
 
 # 初始化logger
 logger = get_logger(__name__)
+
+
+def assess_context(
+    retrieval_results: List[Dict],
+    answerable_min: Optional[float] = None,
+    context_min: Optional[float] = None,
+) -> Tuple[bool, str, Optional[float], int]:
+    """判断检索结果是否足以支撑基于文档的回答，并拼出上下文。
+
+    口径统一为 relevance ∈ [0,1] 越大越相关，由 rag.scoring 计算。
+    此前 answer_smart 与 answer_smart_stream 各有一份重复实现，
+    且把同一个 SIMILARITY_THRESHOLD 在 hybrid 分支当作"1-阈值 的下限"、
+    在向量分支当作"距离上限"，两种相反的物理量。
+
+    参数:
+        retrieval_results: 检索结果列表
+        answerable_min: top1 相关性下限，低于此值视为知识库无答案
+        context_min: 单条 chunk 进入上下文的相关性下限
+
+    返回:
+        (is_answerable, context_text, top_relevance, used_count)
+        无结果时返回 (False, "", None, 0)。
+    """
+    if answerable_min is None:
+        answerable_min = ANSWERABLE_MIN_RELEVANCE
+    if context_min is None:
+        context_min = RETRIEVAL_MIN_RELEVANCE
+
+    if not retrieval_results:
+        return False, "", None, 0
+
+    def relevance_of(result: Dict) -> float:
+        value = result.get('relevance')
+        return value if isinstance(value, (int, float)) else compute_relevance(result)
+
+    top_relevance = max(relevance_of(r) for r in retrieval_results)
+    if top_relevance < answerable_min:
+        return False, "", top_relevance, 0
+
+    context_parts = []
+    for i, result in enumerate(retrieval_results, 1):
+        if relevance_of(result) < context_min:
+            continue
+        meta = result.get('metadata', {})
+        context_parts.append(
+            f"[文档 {i}] 来源: {meta.get('category', 'unknown')}/{meta.get('file', 'unknown')}\n"
+            f"内容: {result['document']}\n"
+        )
+
+    return True, "\n".join(context_parts), top_relevance, len(context_parts)
 
 
 class LLMClient:
@@ -598,95 +650,55 @@ class LLMClient:
         yield from self.stream_generate(prompt)
 
     def answer_smart(self, question: str, retrieval_results: List[Dict],
-                    threshold: Optional[float] = None,
+                    answerable_min: Optional[float] = None,
                     conversation_context: Optional[str] = None) -> Dict:
         """
-        智能回答（基于检索置信度自动分流）
+        智能回答（基于检索相关性自动分流）
 
         参数:
             question: str - 用户问题
             retrieval_results: List[Dict] - 检索结果列表
-            threshold: float - 相似度阈值（可选，默认使用配置）
+            answerable_min: float - top1 相关性下限，低于此值走通用知识
+                                    （默认 ANSWERABLE_MIN_RELEVANCE）
             conversation_context: str - 对话上下文（可选）
 
         返回:
             Dict - 包含答案和元信息:
                 - answer: str - 回答内容
-                - mode: str - 回答模式 ('with_context' / 'without_context')
-                - max_similarity: float - 最高相似度
-                - relevant_docs_count: int - 相关文档数量
+                - mode: str - 'with_context' / 'without_context'
+                - top_relevance: float | None - 最高相关性（[0,1] 越大越相关）
+                - relevant_docs_count: int - 进入上下文的文档数
         """
-        threshold = threshold if threshold is not None else SIMILARITY_THRESHOLD
+        is_answerable, context, top_relevance, relevant_count = assess_context(
+            retrieval_results, answerable_min=answerable_min
+        )
 
-        # 检查是否有检索结果
-        if not retrieval_results:
-            # 没有任何结果，使用通用知识
-            answer = self.answer_without_context(question)
+        if not is_answerable:
+            if top_relevance is None:
+                reason = '知识库中未找到相关文档'
+            else:
+                reason = f'文档相关度不足（top_relevance={top_relevance:.3f}）'
             return {
-                'answer': answer,
+                'answer': self.answer_without_context(question),
                 'mode': 'without_context',
-                'max_similarity': None,
+                'top_relevance': top_relevance,
                 'relevant_docs_count': 0,
-                'reason': '知识库中未找到相关文档'
+                'reason': reason,
             }
 
-        # 获取最相关文档的相似度（兼容 hybrid_score 和 distance 两种模式）
-        best = retrieval_results[0]
-        if best.get('hybrid_score') is not None:
-            best_score = best['hybrid_score']
-            is_relevant = best_score >= (1.0 - threshold)
-            score_repr = f"hybrid_score={best_score:.3f}"
-        else:
-            try:
-                best_score = float(best.get('distance', float('inf')))
-            except (TypeError, ValueError):
-                best_score = float('inf')
-            is_relevant = best_score < threshold
-            score_repr = f"distance={best_score:.3f}"
-
-        # 根据阈值判断
-        if is_relevant:
-            # 有可靠文档，使用文档回答
-            context_parts = []
-            relevant_count = 0
-            for i, result in enumerate(retrieval_results, 1):
-                # 只使用相似度高于阈值的文档（兼容两种模式）
-                if result.get('hybrid_score') is not None:
-                    doc_relevant = result.get('hybrid_score', 0) >= (1.0 - threshold)
-                else:
-                    doc_relevant = (result.get('distance') or float('inf')) < threshold
-                if doc_relevant:
-                    meta = result['metadata']
-                    doc = result['document']
-                    context_parts.append(
-                        f"[文档 {i}] 来源: {meta.get('category', 'unknown')}/{meta.get('file', 'unknown')}\n"
-                        f"内容: {doc}\n"
-                    )
-                    relevant_count += 1
-
-            context = "\n".join(context_parts)
-            answer = self.answer_with_context(question, context, conversation_context=conversation_context)
-
-            return {
-                'answer': answer,
-                'mode': 'with_context',
-                'max_similarity': best_score,
-                'relevant_docs_count': relevant_count,
-                'reason': f'找到 {relevant_count} 个相关文档（{score_repr}）'
-            }
-        else:
-            # 没有可靠文档，使用通用知识
-            answer = self.answer_without_context(question)
-            return {
-                'answer': answer,
-                'mode': 'without_context',
-                'max_similarity': best_score,
-                'relevant_docs_count': 0,
-                'reason': f'文档相关度不足（{score_repr}）'
-            }
+        answer = self.answer_with_context(
+            question, context, conversation_context=conversation_context
+        )
+        return {
+            'answer': answer,
+            'mode': 'with_context',
+            'top_relevance': top_relevance,
+            'relevant_docs_count': relevant_count,
+            'reason': f'找到 {relevant_count} 个相关文档（top_relevance={top_relevance:.3f}）',
+        }
 
     def answer_smart_stream(self, question: str, retrieval_results: List[Dict],
-                           threshold: Optional[float] = None,
+                           answerable_min: Optional[float] = None,
                            conversation_context: Optional[str] = None):
         """
         智能回答（基于检索置信度自动分流 - 流式版本）
@@ -694,71 +706,37 @@ class LLMClient:
         参数:
             question: str - 用户问题
             retrieval_results: List[Dict] - 检索结果列表
-            threshold: float - 相似度阈值（可选，默认使用配置）
+            answerable_min: float - top1 相关性下限，低于此值走通用知识
+                                    （默认 ANSWERABLE_MIN_RELEVANCE）
             conversation_context: str - 对话上下文（可选）
 
         返回:
             生成器 - 首先 yield 元信息字典，然后 yield 答案文本流
         """
-        threshold = threshold if threshold is not None else SIMILARITY_THRESHOLD
+        is_answerable, context, top_relevance, relevant_count = assess_context(
+            retrieval_results, answerable_min=answerable_min
+        )
 
-        # 检查是否有检索结果
-        if not retrieval_results:
-            # 构建通用知识prompt
-            template = NO_CONTEXT_TEMPLATE
-            full_prompt = template.format(question=question)
+        if not is_answerable:
+            full_prompt = NO_CONTEXT_TEMPLATE.format(question=question)
+            if top_relevance is None:
+                reason = '知识库中未找到相关文档'
+            else:
+                reason = f'文档相关度不足（top_relevance={top_relevance:.3f}）'
 
-            # 先返回元信息
             yield {
                 'mode': 'without_context',
-                'max_similarity': None,
+                'top_relevance': top_relevance,
                 'relevant_docs_count': 0,
-                'reason': '知识库中未找到相关文档',
+                'reason': reason,
                 'full_prompt': full_prompt
             }
-            # 然后流式返回答案
             yield from self.answer_without_context_stream(question)
             return
 
-        # 获取最相关文档的相似度（兼容 hybrid_score 和 distance 两种模式）
-        best = retrieval_results[0]
-        if best.get('hybrid_score') is not None:
-            best_score = best['hybrid_score']
-            is_relevant = best_score >= (1.0 - threshold)
-            score_repr = f"hybrid_score={best_score:.3f}"
-        else:
-            try:
-                best_score = float(best.get('distance', float('inf')))
-            except (TypeError, ValueError):
-                best_score = float('inf')
-            is_relevant = best_score < threshold
-            score_repr = f"distance={best_score:.3f}"
-
-        # 根据阈值判断
-        if is_relevant:
-            # 有可靠文档，使用文档回答
-            context_parts = []
-            relevant_count = 0
-            for i, result in enumerate(retrieval_results, 1):
-                if result.get('hybrid_score') is not None:
-                    doc_relevant = result.get('hybrid_score', 0) >= (1.0 - threshold)
-                else:
-                    doc_relevant = (result.get('distance') or float('inf')) < threshold
-                if doc_relevant:
-                    meta = result['metadata']
-                    doc = result['document']
-                    context_parts.append(
-                        f"[文档 {i}] 来源: {meta.get('category', 'unknown')}/{meta.get('file', 'unknown')}\n"
-                        f"内容: {doc}\n"
-                    )
-                    relevant_count += 1
-
-            context = "\n".join(context_parts)
-
-            # 构建完整prompt（用于返回给前端）
-            template = QUERY_TEMPLATE
-            if conversation_context:
-                full_prompt = f"""{conversation_context}
+        # 构建完整 prompt（同时回传前端 Prompt Inspector）
+        if conversation_context:
+            full_prompt = f"""{conversation_context}
 
 当前查询的文档内容：
 {context}
@@ -766,30 +744,19 @@ class LLMClient:
 用户当前问题：{question}
 
 回答："""
-            else:
-                full_prompt = template.format(context=context, question=question)
-
-            yield {
-                'mode': 'with_context',
-                'max_similarity': best_score,
-                'relevant_docs_count': relevant_count,
-                'reason': f'找到 {relevant_count} 个相关文档（{score_repr}）',
-                'full_prompt': full_prompt
-            }
-            yield from self.answer_with_context_stream(question, context, conversation_context=conversation_context)
         else:
-            # 没有可靠文档，使用通用知识
-            template = NO_CONTEXT_TEMPLATE
-            full_prompt = template.format(question=question)
+            full_prompt = QUERY_TEMPLATE.format(context=context, question=question)
 
-            yield {
-                'mode': 'without_context',
-                'max_similarity': best_score,
-                'relevant_docs_count': 0,
-                'reason': f'文档相关度不足（{score_repr}）',
-                'full_prompt': full_prompt
-            }
-            yield from self.answer_without_context_stream(question)
+        yield {
+            'mode': 'with_context',
+            'top_relevance': top_relevance,
+            'relevant_docs_count': relevant_count,
+            'reason': f'找到 {relevant_count} 个相关文档（top_relevance={top_relevance:.3f}）',
+            'full_prompt': full_prompt
+        }
+        yield from self.answer_with_context_stream(
+            question, context, conversation_context=conversation_context
+        )
 
 if __name__ == "__main__":
     # 测试代码
