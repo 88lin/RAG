@@ -4,6 +4,7 @@
 """
 
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -61,17 +62,49 @@ DATA_DIR = PROJECT_ROOT / "data" / "documents"
 DB_DIR = PROJECT_ROOT / "chroma_db"
 
 # ============================================================
+# Embedding 模型配置
+# ============================================================
+# 默认使用中文模型：知识库与查询均为中文，英文模型（all-MiniLM-L6-v2）
+# 在中文语料上向量检索接近噪声排序。
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-small-zh-v1.5")
+
+# bge 中文系列要求查询侧加指令前缀、文档侧不加，该非对称性必须复现，
+# 否则检索收益大幅下降。换回非 bge 模型时自动不加前缀。
+BGE_ZH_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
+
+
+def needs_query_prefix(model_name: str) -> bool:
+    """判断该 embedding 模型是否需要查询侧指令前缀。"""
+    lowered = model_name.lower()
+    return "bge" in lowered and "zh" in lowered
+
+
+# ============================================================
 # 向量数据库配置
 # ============================================================
 CHROMA_DB_PATH = str(DB_DIR)
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "techcorp_docs")
+COLLECTION_BASE_NAME = os.getenv("COLLECTION_NAME", "techcorp_docs")
 SIMILARITY_METRIC = os.getenv("SIMILARITY_METRIC", "cosine")
 
-# ============================================================
-# Embedding 模型配置
-# ============================================================
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
-EMBEDDING_DIM = 384  # all-MiniLM-L6-v2 固定维度
+
+def model_slug(model_name: str) -> str:
+    """把模型名转成可用作 collection 名的片段。"""
+    return re.sub(r"[^a-z0-9]+", "_", model_name.lower()).strip("_")
+
+
+def collection_name_for(model_name: str) -> str:
+    """按 embedding 模型生成隔离的 collection 名。
+
+    不同模型的向量必须物理隔离：维度不同（384 vs 512）会直接报错；
+    维度相同则静默返回垃圾结果且极难排查。
+    隔离同时是 A/B 对比与回滚的前提 —— 换模型不销毁旧数据。
+
+    例：techcorp_docs__baai_bge_small_zh_v1_5
+    """
+    return f"{COLLECTION_BASE_NAME}__{model_slug(model_name)}"
+
+
+COLLECTION_NAME = collection_name_for(EMBEDDING_MODEL_NAME)
 
 # ============================================================
 # 文本分块配置
@@ -81,12 +114,25 @@ CHUNK_OVERLAP = get_int("CHUNK_OVERLAP", 100)
 CHUNK_STEP = CHUNK_SIZE - CHUNK_OVERLAP
 
 # ============================================================
-# 检索配置（阶段1）
+# 检索配置
 # ============================================================
 TOP_K_RESULTS = get_int("TOP_K_RESULTS", 3)
-SIMILARITY_THRESHOLD = get_float("SIMILARITY_THRESHOLD", 0.7)
-RETRIEVAL_DISTANCE_THRESHOLD = get_float("RETRIEVAL_DISTANCE_THRESHOLD", 0.7)
-MIN_RELEVANCE_SCORE = 0.3  # 保留用于未来扩展
+
+# ── 相关性阈值 ────────────────────────────────────────────────
+# 两个阈值都建立在同一个口径上：relevance ∈ [0,1]，越大越相关，
+# 由 rag.scoring.compute_relevance() 统一计算。
+#
+# 此前只有一个 SIMILARITY_THRESHOLD，却在两处被当作不同物理量使用
+# （一处是 hybrid_score 下限，越大越好；一处是余弦距离上限，越小越好），
+# 导致任何基于它的指标都无法解释。现拆为两个语义明确的阈值。
+#
+# 初值为拍定值，M1 建立评测集后用数据校准（横轴阈值、纵轴无答案识别率
+# 与误拒率，取拐点）。
+RETRIEVAL_MIN_RELEVANCE = get_float("RETRIEVAL_MIN_RELEVANCE", 0.35)   # 低于此值不进 prompt 上下文
+ANSWERABLE_MIN_RELEVANCE = get_float("ANSWERABLE_MIN_RELEVANCE", 0.50)  # top1 低于此值判定知识库无答案
+
+# RRF 融合平滑常数，见 rag/scoring.py
+RRF_K = get_int("RRF_K", 60)
 
 # 检索模式（universal=全库搜索，metadata_only=类别名过滤，keyword=关键词分类）
 RETRIEVAL_MODE = os.getenv("RETRIEVAL_MODE", "universal")
@@ -117,12 +163,13 @@ RERANK_TOP_K = get_int("RERANK_TOP_K", 20)
 RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base")  # 中文首选
 
 # ============================================================
-# Hybrid混合检索配置（阶段3 Part 2）
+# Hybrid 混合检索配置
 # ============================================================
+# 融合方式为 RRF（Reciprocal Rank Fusion），只用排名不用分数，
+# 因此不存在 BM25_WEIGHT / VECTOR_WEIGHT —— 两路分数量纲不同，
+# 加权相加没有物理意义，原先的 0.7/0.3 是无效参数。
 ENABLE_HYBRID = get_bool("ENABLE_HYBRID", True)   # 默认开启，中文场景首选
-BM25_WEIGHT = get_float("BM25_WEIGHT", 0.3)      # BM25权重
-VECTOR_WEIGHT = get_float("VECTOR_WEIGHT", 0.7)  # 向量检索权重
-HYBRID_TOP_K = get_int("HYBRID_TOP_K", 20)       # Hybrid检索候选数
+HYBRID_TOP_K = get_int("HYBRID_TOP_K", 20)       # 每路召回的候选数
 
 # ============================================================
 # 对话管理配置（Phase 1）
