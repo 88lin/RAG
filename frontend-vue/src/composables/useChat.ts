@@ -1,4 +1,4 @@
-import { ref, computed, type Ref } from 'vue';
+import { ref, type Ref } from 'vue';
 import { apiService } from '@/services/api';
 import type { Message, LogEntry, SSEEvent, CitationDetail } from '@/types';
 import { useSSEStream } from './useSSEStream';
@@ -13,7 +13,9 @@ export function useChat(logs: Ref<LogEntry[]>, onCitationsReceived?: (chunkIds: 
   const isThinking = ref(false);
   const isRagEnabled = ref(true);
   const sessionId = ref(`session-${Date.now()}`);
-  const currentSimilarity = ref(0);
+  const currentRelevance = ref(0);
+  // relevance 的计算依据：'rerank' 为 cross-encoder 概率，'cosine' 为余弦相似度
+  const relevanceBasis = ref<'rerank' | 'cosine' | null>(null);
   const lastPrompt = ref<string | null>(null);
   const highlightedChunkId = ref<string | null>(null);
 
@@ -42,7 +44,8 @@ export function useChat(logs: Ref<LogEntry[]>, onCitationsReceived?: (chunkIds: 
     isThinking.value = true;
     currentAiMessage = '';
     currentMessageId = `msg-${Date.now()}-ai`;
-    currentSimilarity.value = 0;  // 每次新消息重置相似度
+    currentRelevance.value = 0;  // 每次新消息重置相关性
+    relevanceBasis.value = null;
     lastPrompt.value = null;
 
     // 添加空 AI 消息占位
@@ -111,49 +114,17 @@ export function useChat(logs: Ref<LogEntry[]>, onCitationsReceived?: (chunkIds: 
         break;
 
       case 'retrieval_results':
-        // 从检索结果的 top-1 中提取相似度
+        // 直接采用后端 relevance（[0,1] 越大越相关，由 rag/scoring.py 统一计算）。
+        // 此前前端还做了一层分段拉伸（≥0.7 乘 1.1、<0.4 乘 0.6），
+        // 使展示值既非余弦相似度也非模型概率，无法解释。展示层不再二次加工。
         if (event.data.results && event.data.results.length > 0) {
-          const topResult = event.data.results[0];
-
-          // 🎯 最佳实践：轻度非线性映射，突出高质量匹配
-          // 后端已使用绝对距离转换，分数更合理，前端只需轻微调整
-          let rawSimilarity = 0;
-
-          // 优先使用 score（hybrid_score 或 rerank_score）
-          if (topResult.score !== undefined && topResult.score > 0) {
-            rawSimilarity = topResult.score;
-          } else if (topResult.distance !== undefined) {
-            // 回退到 distance 计算（余弦距离 0-2 → 相似度 0-1）
-            rawSimilarity = Math.max(0, 1 - topResult.distance / 2);
+          const top = event.data.results[0];
+          if (typeof top.relevance === 'number') {
+            currentRelevance.value = Math.max(0, Math.min(1, top.relevance));
           }
-
-          // 轻度非线性映射：强调高质量匹配，压缩低质量匹配
-          let displaySimilarity: number;
-          if (rawSimilarity >= 0.7) {
-            // 高质量匹配（70%+）：保持或略微提升
-            displaySimilarity = Math.min(1.0, rawSimilarity * 1.1);
-          } else if (rawSimilarity >= 0.4) {
-            // 中等匹配（40-70%）：保持原值
-            displaySimilarity = rawSimilarity;
-          } else {
-            // 低质量匹配（<40%）：压缩到更低
-            displaySimilarity = rawSimilarity * 0.6;  // <40% → <24%
+          if (top.relevance_basis === 'rerank' || top.relevance_basis === 'cosine') {
+            relevanceBasis.value = top.relevance_basis;
           }
-
-          currentSimilarity.value = Math.max(0, Math.min(1, displaySimilarity));
-          console.log('[相似度更新]', 'raw:', rawSimilarity.toFixed(3), '→ display:', currentSimilarity.value.toFixed(3));
-        }
-        break;
-
-      case 'retrieval_done':
-        // 更新相似度分数（从检索结果中提取距离）
-        if (event.data.distances && event.data.distances.length > 0) {
-          const maxDist = Math.min(...event.data.distances);
-          currentSimilarity.value = Math.max(0, 1 - maxDist);
-        }
-        // 也可能在 data 中直接有分数
-        if (event.data.similarity !== undefined) {
-          currentSimilarity.value = event.data.similarity;
         }
         break;
 
@@ -223,7 +194,8 @@ export function useChat(logs: Ref<LogEntry[]>, onCitationsReceived?: (chunkIds: 
     messages,
     isThinking,
     isRagEnabled,
-    currentSimilarity,
+    currentRelevance,
+    relevanceBasis,
     lastPrompt,
     highlightedChunkId,
     sendMessage,

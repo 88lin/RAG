@@ -14,6 +14,7 @@ from datetime import datetime
 from rag import Retriever, LLMClient, VectorDB, Embedder
 from rag.conversation import ConversationManager, ReferenceResolver
 from rag.logger import get_logger
+from rag.scoring import compute_relevance
 
 logger = get_logger(__name__)
 
@@ -204,12 +205,15 @@ class ChatService:
                 # 2.3 检索方法通知
                 retrieval_method = stats.get('retrieval_method', 'unknown')
                 if retrieval_method == 'hybrid':
+                    # RRF 融合没有权重参数：只用排名，不用分数。
+                    # 此前这里硬编码 0.7/0.3，即使配置改了前端显示也不会变。
+                    from config import RRF_K
                     yield {
                         "type": "hybrid_search_start",
                         "data": {
                             "method": "hybrid",
-                            "vector_weight": 0.7,
-                            "bm25_weight": 0.3
+                            "fusion": "rrf",
+                            "rrf_k": RRF_K
                         }
                     }
                     # BM25 索引构建（模拟）
@@ -241,29 +245,37 @@ class ChatService:
                     }
 
                 # 2.5 检索结果详情
+                # relevance 由 rag.scoring 统一计算（[0,1] 越大越相关）。
+                # 此前用 `or` 链在 rerank_score / hybrid_score / 1-distance
+                # 之间回退，既混用不同物理量，又会把合法的 0.0 判为缺失。
                 result_details = []
                 for i, r in enumerate(results[:5], 1):  # 只推送前5个
-                    raw_distance = r.get('distance')
-                    try:
-                        distance = float(raw_distance) if raw_distance is not None else None
-                    except (TypeError, ValueError):
-                        distance = None
-                    distance_for_score = distance if distance is not None else 1.0
-                    distance = distance_for_score
-                    # 优先级：rerank_score > hybrid_score > 1-distance
-                    # 因为 rerank 是在 hybrid 基础上交叉编码器精排，最准确
-                    best_score = (
-                        r.get('rerank_score') or      # 优先级1: 重排序分数（最精准）
-                        r.get('hybrid_score') or      # 优先级2: 混合检索分数
-                        max(0.0, 1.0 - distance)      # 优先级3: 向量距离转换
-                    )
-                    result_details.append({
+                    relevance = r.get('relevance')
+                    if not isinstance(relevance, (int, float)):
+                        relevance = compute_relevance(r)
+
+                    detail = {
                         "rank": i,
                         "file": r.get('metadata', {}).get('file', 'unknown'),
                         "category": r.get('metadata', {}).get('category', 'unknown'),
-                        "score": round(best_score, 3),
-                        "distance": round(distance, 3)
-                    })
+                        "relevance": round(float(relevance), 3),
+                        # relevance 的物理含义取决于是否经过精排，前端据此标注口径：
+                        #   rerank — cross-encoder 判定相关的概率 sigmoid(logit)
+                        #   cosine — 归一化向量的余弦相似度 1 - d/2
+                        "relevance_basis": (
+                            "rerank" if isinstance(r.get('rerank_logit'), (int, float))
+                            else "cosine"
+                        ),
+                        "retrieved_by": r.get('retrieved_by', []),
+                    }
+
+                    cosine_distance = r.get('cosine_distance')
+                    if isinstance(cosine_distance, (int, float)):
+                        detail["cosine_distance"] = round(float(cosine_distance), 3)
+                    if isinstance(r.get('rrf_score'), (int, float)):
+                        detail["rrf_score"] = round(float(r['rrf_score']), 5)
+
+                    result_details.append(detail)
 
                 yield {
                     "type": "retrieval_results",
@@ -285,25 +297,31 @@ class ChatService:
             citations = []
             full_prompt = ""  # 用于 Prompt Inspector
 
-            # 智能判断：如果没有检索结果或相似度不足，使用混合式RAG（回退到通用知识）
-            from config import SIMILARITY_THRESHOLD
-            should_use_context = False
+            # 判断检索证据是否足以支撑基于文档的回答。
+            # 口径统一为 relevance ∈ [0,1] 越大越相关，不再按检索模式分叉 ——
+            # 此前 hybrid 与 vector 两个分支把同一个 SIMILARITY_THRESHOLD
+            # 当作方向相反的两种物理量。
+            from config import ANSWERABLE_MIN_RELEVANCE
 
+            top_relevance = None
             if results:
-                best = results[0]
-                if best.get('hybrid_score') is not None:
-                    # Hybrid 模式：hybrid_score ∈ [0,1]，(1-threshold) 为最低门槛
-                    score = best['hybrid_score']
-                    should_use_context = score >= (1.0 - float(SIMILARITY_THRESHOLD))
-                    logger.info(f"[{session_id}] 相似度检查(hybrid): score={score:.3f}, min={(1.0-float(SIMILARITY_THRESHOLD)):.3f}, use_context={should_use_context}")
-                else:
-                    # 纯向量模式：distance 越小越好
-                    try:
-                        distance_value = float(best.get('distance', float('inf')))
-                    except (TypeError, ValueError):
-                        distance_value = float('inf')
-                    should_use_context = distance_value < float(SIMILARITY_THRESHOLD)
-                    logger.info(f"[{session_id}] 相似度检查(vector): distance={distance_value:.3f}, threshold={SIMILARITY_THRESHOLD}, use_context={should_use_context}")
+                top_relevance = max(
+                    (
+                        r['relevance'] if isinstance(r.get('relevance'), (int, float))
+                        else compute_relevance(r)
+                    )
+                    for r in results
+                )
+
+            should_use_context = (
+                top_relevance is not None
+                and top_relevance >= ANSWERABLE_MIN_RELEVANCE
+            )
+            logger.info(
+                f"[{session_id}] 可答性检查: top_relevance="
+                f"{'None' if top_relevance is None else f'{top_relevance:.3f}'}, "
+                f"min={ANSWERABLE_MIN_RELEVANCE}, use_context={should_use_context}"
+            )
 
             # 如果有高质量检索结果且启用引用，使用引用模式
             if enable_citation and should_use_context:
@@ -347,7 +365,7 @@ class ChatService:
                     lambda: self.llm.answer_smart_stream(
                         resolved_question,
                         results,
-                        threshold=float(SIMILARITY_THRESHOLD),  # 显式传入 float 类型
+                        answerable_min=ANSWERABLE_MIN_RELEVANCE,
                         conversation_context=conversation_context
                     )
                 ):
@@ -407,7 +425,11 @@ class ChatService:
                 'category': r.get('metadata', {}).get('category', 'unknown'),
                 # 修复：检索结果用 'document' 字段存原文，不是 'content'
                 'content': r.get('document', ''),
-                'score': r.get('hybrid_score') or r.get('score') or 0.0
+                # 引用卡片展示的相关性，与检索面板同一口径
+                'relevance': (
+                    r['relevance'] if isinstance(r.get('relevance'), (int, float))
+                    else compute_relevance(r)
+                ),
             }
 
         citations = []
@@ -450,7 +472,7 @@ class ChatService:
                         "file": file_name,
                         "category": doc_info.get('category', 'unknown'),
                         "content": doc_info.get('content', ''),
-                        "score": doc_info.get('score', 0.0)
+                        "relevance": doc_info.get('relevance', 0.0)
                     })
 
                 buffer = buffer[match.end():]

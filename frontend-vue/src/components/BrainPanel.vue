@@ -17,10 +17,10 @@
       </div>
     </div>
 
-    <!-- Similarity Gauge (纯 SVG，无第三方依赖) -->
+    <!-- Relevance Gauge (纯 SVG，无第三方依赖) -->
     <div class="p-4 border-b border-deep-800 bg-deep-950/30">
       <div class="flex items-center justify-between mb-2">
-        <span class="text-slate-400 tracking-widest text-sm">检索质量</span>
+        <span class="text-slate-400 tracking-widest text-sm">Top-1 相关性</span>
         <Cpu :size="18" class="text-slate-600" />
       </div>
 
@@ -50,9 +50,10 @@
         <!-- 数值显示，居中叠在 SVG 上 -->
         <div class="absolute bottom-2 left-1/2 -translate-x-1/2 text-center">
           <div class="text-3xl font-bold text-slate-100" style="transition: all 0.3s ease;">
-            {{ similarityPercent }}%
+            {{ relevancePercent }}%
           </div>
-          <div class="text-xs text-slate-500">相似度</div>
+          <!-- 标注口径：这个数字是什么，取决于是否启用了精排 -->
+          <div class="text-xs text-slate-500">{{ relevanceCaption }}</div>
         </div>
       </div>
     </div>
@@ -110,7 +111,9 @@ import type { LogEntry } from '@/types';
 
 interface Props {
   logs: LogEntry[];
-  currentSimilarity: number;
+  currentRelevance: number;
+  /** relevance 的计算依据，决定这个百分比的物理含义 */
+  relevanceBasis?: 'rerank' | 'cosine' | null;
   lastPrompt: string | null;
   ragStatus: string;
 }
@@ -120,19 +123,28 @@ const props = defineProps<Props>();
 const isPromptOpen = ref(false);
 const logsContainer = ref<HTMLDivElement>();
 
-// 相似度百分比（0-100）
-const similarityPercent = computed(() => Math.round(props.currentSimilarity * 100));
+// 相关性百分比（0-100）
+const relevancePercent = computed(() => Math.round(props.currentRelevance * 100));
+
+// 明确标注这个数字是什么，避免"某个不知道量纲的分数"这种展示
+const relevanceCaption = computed(() => {
+  if (props.relevanceBasis === 'rerank') return '精排相关概率';
+  if (props.relevanceBasis === 'cosine') return '余弦相似度';
+  return '相关性';
+});
 
 // SVG 半圆弧长：半径50，弧度180° = π*50 ≈ 157
 // 进度弧长 = 157 * percent / 100
-const gaugeArcLength = computed(() => (157 * similarityPercent.value) / 100);
+const gaugeArcLength = computed(() => (157 * relevancePercent.value) / 100);
 
-// 根据分数决定颜色
+// 阈值与后端 config 对齐：
+//   ANSWERABLE_MIN_RELEVANCE = 0.50 —— 低于此值判定知识库无答案
+//   RETRIEVAL_MIN_RELEVANCE  = 0.35 —— 低于此值不进 prompt 上下文
 const gaugeColor = computed(() => {
-  const p = similarityPercent.value;
-  if (p >= 70) return '#06b6d4'; // neon-blue：高相似度
-  if (p >= 30) return '#f59e0b'; // 橙色：中等
-  return '#ef4444';              // 红色：低相似度
+  const p = relevancePercent.value;
+  if (p >= 50) return '#06b6d4'; // neon-blue：足以支撑基于文档的回答
+  if (p >= 35) return '#f59e0b'; // 橙色：可进上下文，但不足以判定可答
+  return '#ef4444';              // 红色：视为知识库无答案
 });
 
 // 日志自动滚动到底部

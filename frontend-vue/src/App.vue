@@ -33,7 +33,8 @@
       <div class="w-[560px]">
         <BrainPanel
           :logs="logs"
-          :current-similarity="currentSimilarity"
+          :current-relevance="currentRelevance"
+          :relevance-basis="relevanceBasis"
           :last-prompt="lastPrompt"
           :rag-status="currentStatus"
         />
@@ -85,7 +86,8 @@ const {
   messages,
   isThinking,
   isRagEnabled,
-  currentSimilarity,
+  currentRelevance,
+  relevanceBasis,
   lastPrompt,
   highlightedChunkId,
   sendMessage,

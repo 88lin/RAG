@@ -61,7 +61,8 @@ export function useSSEStream() {
 
       // 混合检索
       case 'hybrid_search_start':
-        message = `Hybrid search (vector ${Math.round((event.data.vector_weight || 0.7) * 100)}% + BM25 ${Math.round((event.data.bm25_weight || 0.3) * 100)}%)`;
+        // RRF 融合只用排名，没有权重可显示
+        message = `Hybrid search: vector + BM25, fused by ${(event.data.fusion || 'rrf').toUpperCase()} (k=${event.data.rrf_k ?? 60})`;
         break;
       case 'bm25_indexing':
         message = `Building BM25 index (${event.data.doc_count || 0} docs)...`;
@@ -92,10 +93,13 @@ export function useSSEStream() {
         message = `Retrieved ${results.length} results (total: ${event.data.total || 0})`;
         if (results.length > 0) {
           const top = results[0];
-          const similarity = top.score !== undefined
-            ? top.score
-            : Math.max(0, 1 - ((top.distance || 0) / 2));
-          details = `Top match: ${top.file} (similarity: ${similarity.toFixed(2)}, score: ${(top.score || 0).toFixed(2)})`;
+          // 直接用后端 relevance，不在展示层重算或换算
+          const relevance = typeof top.relevance === 'number' ? top.relevance : 0;
+          const basis = top.relevance_basis === 'rerank' ? 'rerank' : 'cosine';
+          const via = Array.isArray(top.retrieved_by) && top.retrieved_by.length
+            ? `, via: ${top.retrieved_by.join('+')}`
+            : '';
+          details = `Top match: ${top.file} (relevance: ${relevance.toFixed(3)} [${basis}]${via})`;
         }
         break;
       case 'rerank_start':

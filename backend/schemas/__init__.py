@@ -53,7 +53,10 @@ class CitationInfo(BaseModel):
     file: str = Field(..., description="文件名")
     category: str = Field(..., description="分类")
     content: str = Field(..., description="引用内容")
-    score: float = Field(..., description="相似度分数")
+    relevance: float = Field(
+        ..., ge=0.0, le=1.0,
+        description="相关性，[0,1] 越大越相关，由 rag.scoring 统一计算"
+    )
 
 class QueryResponse(BaseModel):
     """对话查询响应"""
