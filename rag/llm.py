@@ -17,7 +17,7 @@ from typing import Optional, List, Dict, Iterator, Tuple
 import time
 import functools
 from .logger import get_logger
-from .scoring import compute_relevance
+from .scoring import compute_relevance, has_relevance_signal
 
 # 初始化logger
 logger = get_logger(__name__)
@@ -57,6 +57,19 @@ def assess_context(
         return value if isinstance(value, (int, float)) else compute_relevance(result)
 
     top_relevance = max(relevance_of(r) for r in retrieval_results)
+
+    # 无相关性信息时（如纯 BM25 检索，其分数无界故无 [0,1] 映射）
+    # 不做阈值判断：全部 relevance 为 0.0，照常比较会拒绝所有查询。
+    # 退化为信任检索层的排序。
+    has_signal = any(has_relevance_signal(r) for r in retrieval_results)
+    if not has_signal:
+        context_parts = [
+            f"[文档 {i}] 来源: {r.get('metadata', {}).get('category', 'unknown')}/"
+            f"{r.get('metadata', {}).get('file', 'unknown')}\n内容: {r['document']}\n"
+            for i, r in enumerate(retrieval_results, 1)
+        ]
+        return True, "\n".join(context_parts), top_relevance, len(context_parts)
+
     if top_relevance < answerable_min:
         return False, "", top_relevance, 0
 

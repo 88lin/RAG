@@ -14,7 +14,7 @@ from datetime import datetime
 from rag import Retriever, LLMClient, VectorDB, Embedder
 from rag.conversation import ConversationManager, ReferenceResolver
 from rag.logger import get_logger
-from rag.scoring import compute_relevance
+from rag.scoring import compute_relevance, has_relevance_signal
 
 logger = get_logger(__name__)
 
@@ -304,6 +304,12 @@ class ChatService:
             from config import ANSWERABLE_MIN_RELEVANCE
 
             top_relevance = None
+            # 是否有任何一条结果带可解释的相关性信息。
+            # 纯 BM25 检索没有（BM25 分数无界，无自然的 [0,1] 映射），
+            # 此时全部 relevance 为 0.0，若照常比阈值会拒绝所有查询 ——
+            # 实测纯 bm25 方案 Recall@5=0.586，排序是对的，不该被拒。
+            has_signal = any(has_relevance_signal(r) for r in results) if results else False
+
             if results:
                 top_relevance = max(
                     (
@@ -313,12 +319,17 @@ class ChatService:
                     for r in results
                 )
 
-            should_use_context = (
-                top_relevance is not None
-                and top_relevance >= ANSWERABLE_MIN_RELEVANCE
-            )
+            if not results:
+                should_use_context = False
+            elif not has_signal:
+                # 无相关性信息时退化为"有结果就用" —— 由检索层的排序负责质量，
+                # 不做无依据的阈值判断。
+                should_use_context = True
+            else:
+                should_use_context = top_relevance >= ANSWERABLE_MIN_RELEVANCE
+
             logger.info(
-                f"[{session_id}] 可答性检查: top_relevance="
+                f"[{session_id}] 可答性检查: has_signal={has_signal}, top_relevance="
                 f"{'None' if top_relevance is None else f'{top_relevance:.3f}'}, "
                 f"min={ANSWERABLE_MIN_RELEVANCE}, use_context={should_use_context}"
             )

@@ -95,6 +95,36 @@ def compute_relevance(result: Dict[str, Any]) -> float:
     return 0.0
 
 
+def has_relevance_signal(result: Dict[str, Any]) -> bool:
+    """该结果是否含可计算相关性的信息。
+
+    存在的理由：`compute_relevance()` 在无信息时返回 0.0，
+    这个 0.0 与"计算得出确实不相关"无法区分。两者的处置应当不同：
+
+        无信息   -> 不能用阈值判断可答性（会把全部结果误判为不可答）
+        确实不相关 -> 阈值判断有效
+
+    典型的无信息场景是纯 BM25 检索：BM25 分数是无界的 TF-IDF 累加
+    （可以是 3.7 也可以是 37），没有自然的 [0,1] 映射 ——
+    这正是用 RRF 而非归一化加权的理由。给它编一个映射会重新引入
+    本模块要消除的那种不可解释的量纲。
+
+    实测证据：纯 bm25 方案的 Recall@5 为 0.586（排序能力正常），
+    但全部 relevance 为 0.0。若下游据此判断可答性，会拒绝所有查询。
+
+    参数:
+        result: 检索结果字典
+
+    返回:
+        bool —— True 表示 compute_relevance() 的返回值有意义。
+    """
+    for key in ("rerank_logit", "cosine_distance"):
+        value = result.get(key)
+        if not isinstance(value, bool) and isinstance(value, (int, float)):
+            return True
+    return False
+
+
 def rrf_fuse(
     *ranked_lists: Sequence[str],
     k: int = RRF_K_DEFAULT,

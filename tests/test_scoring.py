@@ -15,7 +15,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rag.scoring import compute_relevance, rrf_fuse, RRF_K_DEFAULT
+from rag.scoring import (
+    RRF_K_DEFAULT,
+    compute_relevance,
+    has_relevance_signal,
+    rrf_fuse,
+)
 
 
 # ============================================================
@@ -164,6 +169,37 @@ class TestRRFFuse:
         gap_small = dict(rrf_fuse(["a", "b"], k=1))
         gap_large = dict(rrf_fuse(["a", "b"], k=1000))
         assert (gap_small["a"] - gap_small["b"]) > (gap_large["a"] - gap_large["b"])
+
+
+class TestHasRelevanceSignal:
+    """区分"无相关性信息"与"确实不相关" —— 两者都是 0.0，处置不同。"""
+
+    def test_rerank_logit_is_signal(self):
+        assert has_relevance_signal({"rerank_logit": 0.0}) is True
+
+    def test_cosine_distance_is_signal(self):
+        assert has_relevance_signal({"cosine_distance": 2.0}) is True
+
+    def test_bm25_only_has_no_signal(self):
+        """纯 BM25 结果没有可解释的相关性。
+
+        BM25 分数是无界 TF-IDF 累加，无自然的 [0,1] 映射。
+        实测：纯 bm25 方案 Recall@5=0.586（排序正常）但 relevance 全为 0.0，
+        若下游据此判断可答性会拒绝所有查询。
+        """
+        result = {"id": "x", "bm25_score": 12.7, "document": "..."}
+        assert has_relevance_signal(result) is False
+        assert compute_relevance(result) == 0.0
+
+    def test_empty_has_no_signal(self):
+        assert has_relevance_signal({}) is False
+
+    def test_none_distance_has_no_signal(self):
+        assert has_relevance_signal({"cosine_distance": None}) is False
+
+    def test_bool_is_not_signal(self):
+        """bool 是 int 子类，但不是合法分数。"""
+        assert has_relevance_signal({"rerank_logit": True}) is False
 
 
 class TestSeparationOfConcerns:
