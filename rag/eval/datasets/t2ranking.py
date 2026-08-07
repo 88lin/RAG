@@ -24,6 +24,8 @@ collection.tsv 有 3.5GB，不下载全量。策略：
 from __future__ import annotations
 
 import random
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
@@ -51,37 +53,68 @@ DISTRACTOR_RATIO = 8
 CHUNK_BYTES = 1 << 20  # 1 MiB
 
 
+def _download_with_curl(url: str, dest: Path) -> bool:
+    """用 curl 下载，返回是否成功。
+
+    为什么不用 requests：实测在 hf-mirror 上 requests + iter_content
+    只有约 12 KB/s，而 curl 能跑到 9 MB/s（差 700 倍）。
+    原因是连接复用与缓冲策略的差异，不是网络问题。
+    3.5GB 文件按 requests 的速率要 70 小时以上，不可行。
+
+    `-C -` 是 curl 原生的断点续传，服务端返回 416（已完整）时
+    curl 退出码为 33 或 0，两者都视为成功。
+    """
+    if not shutil.which("curl"):
+        return False
+
+    command = [
+        "curl", "-sL", "--fail-with-body",
+        "-C", "-",                      # 断点续传
+        "--retry", "5",
+        "--retry-delay", "3",
+        "--connect-timeout", "30",
+        "-o", str(dest),
+        url,
+    ]
+    print(f"  [curl] {dest.name}")
+    completed = subprocess.run(command, capture_output=True, text=True)
+
+    # 33 = 服务端不支持 Range；36 = 无法续传（本地已完整）
+    if completed.returncode in (0, 33, 36):
+        return dest.exists() and dest.stat().st_size > 0
+
+    print(f"  [warn] curl 退出码 {completed.returncode}，回退到 requests")
+    return False
+
+
 def _download(url: str, dest: Path, timeout: int = 60) -> Path:
     """下载文件，支持断点续传。
 
     3.5GB 文件中断后从头再来不可接受，因此用 Range 请求续传。
-    校验方式是比对 Content-Length：不匹配则重下（不做 checksum，
-    数据集本身没提供）。
+
+    完整性判定用同目录的 `.done` 标记文件，不依赖 HEAD 的 Content-Length：
+    hf-mirror 会 302 到上游，HEAD 拿到的长度与实际响应体可能不一致，
+    据此判定会对已下完的文件发起 Range 请求并收到 416。
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
+    marker = dest.with_suffix(dest.suffix + ".done")
 
-    # 先探远端大小
-    head = requests.head(url, allow_redirects=True, timeout=timeout)
-    head.raise_for_status()
-    total = int(head.headers.get("content-length", 0))
+    if marker.exists() and dest.exists():
+        print(f"  [skip] 已完整: {dest.name} ({dest.stat().st_size / 1048576:.1f} MB)")
+        return dest
 
-    if dest.exists():
-        local = dest.stat().st_size
-        if total and local == total:
-            print(f"  [skip] 已完整: {dest.name} ({local / 1048576:.1f} MB)")
-            return dest
-        if local > total > 0:
-            print(f"  [warn] 本地文件比远端大，重新下载: {dest.name}")
-            dest.unlink()
-            local = 0
-    else:
-        local = 0
+    # 大文件优先走 curl，速率相差三个数量级
+    if _download_with_curl(url, dest):
+        size_mb = dest.stat().st_size / 1048576
+        print(f"  {dest.name}: 完成 ({size_mb:.1f} MB)")
+        marker.touch()
+        return dest
+
+    local = dest.stat().st_size if dest.exists() else 0
 
     headers = {}
     mode = "wb"
     if local > 0:
-        # 服务端不支持 Range 时会返回 200 而非 206，此时必须从头写，
-        # 否则会把完整内容追加到已有片段后面，产出损坏文件。
         headers["Range"] = f"bytes={local}-"
         mode = "ab"
         print(f"  [resume] 从 {local / 1048576:.1f} MB 续传: {dest.name}")
@@ -89,12 +122,25 @@ def _download(url: str, dest: Path, timeout: int = 60) -> Path:
     response = requests.get(
         url, headers=headers, stream=True, allow_redirects=True, timeout=timeout
     )
-    response.raise_for_status()
 
+    # 416 = 请求范围超出文件大小，通常意味着本地已经是完整文件
+    if response.status_code == 416:
+        print(f"  [skip] 远端确认已完整: {dest.name}")
+        marker.touch()
+        return dest
+
+    # 服务端不支持 Range 时返回 200 而非 206。此时必须从头写，
+    # 否则会把完整内容追加到已有片段后面，产出静默损坏的文件。
     if local > 0 and response.status_code == 200:
         print("  [warn] 服务端不支持断点续传，改为完整下载")
         mode = "wb"
         local = 0
+
+    response.raise_for_status()
+
+    # 剩余字节数（206 时 content-length 是剩余量，不是总量）
+    remaining = int(response.headers.get("content-length", 0))
+    total = local + remaining if remaining else 0
 
     done = local
     # 进度按百分比节流：3.5GB 文件每 MiB 打一行会刷出三千多行，
@@ -115,7 +161,11 @@ def _download(url: str, dest: Path, timeout: int = 60) -> Path:
                         flush=True,
                     )
                     next_report = pct + 10
+
     print(f"  {dest.name}: 完成 ({done / 1048576:.1f} MB)")
+    # 只有正常读完整个响应体才落标记，中途异常会跳过这里，
+    # 下次运行据此判定为不完整并续传。
+    marker.touch()
     return dest
 
 
