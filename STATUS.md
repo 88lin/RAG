@@ -4,94 +4,85 @@
 
 ## 当前位置
 
-**阶段**：M0 地基修正 —— **已完成**（`docs/plans/M0-foundation.md`）
-**下一步**：M1 评测集与检索实验
-**HEAD**：`c3f8ecc`
+**阶段**：M1 评测集与检索实验（`docs/plans/M1-evaluation.md`）
+**进度**：T1/T2/T3 完成，检索层报告已出。T4/T5 未开始。
+**HEAD**：`3eedab4`
 
-## M0 任务状态
+**正在后台运行**：`rrf_rerank` 补跑（36/300，约 2 秒/条，预计 100 分钟）。
+不阻塞其他工作，跑完后重新 `python scripts/run_eval.py score` 更新报告即可。
 
-| 任务 | 状态 |
-|---|---|
-| T1 统一相关性口径 | 完成 |
-| T2 Embedder 双侧编码 | 完成 |
-| T3 collection 模型指纹 | 完成 |
-| T4 RRF 替换加权融合 | 完成 |
-| T5 chunk 定位字段 | 完成 |
-| T6 reindex.py | 完成 |
-| T7 compare_embeddings.py | 完成 |
+## M1 任务状态
 
-## 验收结果（A1-A9 全部通过）
-
-| # | 标准 | 实测 |
+| 任务 | 状态 | 说明 |
 |---|---|---|
-| A1 | 业务代码无 `SIMILARITY_THRESHOLD` | 通过 |
-| A2 | `scoring.py` 单测通过 | 31 passed |
-| A3 | `rerank_logit=0.0` 不被跳过 | 通过（sigmoid(0)=0.5） |
-| A4 | 两 collection 并存 384/512 维 | 通过 |
-| A5 | metadata 含 doc_key/seq/total_chunks | 通过 |
-| A6 | `get_neighbors` 可取相邻块 | seq=0→[1]，seq=2→[1,3]，seq=4→[3] |
-| A7 | 10 条查询双模型并排输出 | 通过，见下 |
-| A8 | `vue-tsc --noEmit` | exit 0 |
-| A9 | 后端可导入 | 通过 |
+| T1 数据集接入 | 完成 | T2Ranking，300 query / 13,536 段语料 |
+| T2 指标实现 | 完成 | 35 条单测，Recall/MRR/nDCG/延迟分位 |
+| T3 实验 runner | 完成 | 5 variant，4 个已跑满 300 条 |
+| T4 生成层评测 | 未开始 | Ragas + 人工抽检一致率 |
+| T5 无答案阈值校准 | 未开始 | 依赖 T1 的数据 |
+| T6 报告 | 部分 | 检索层已出，生成层待补 |
 
-## 换 embedding 模型的实测收益（A7）
+## 检索层核心结论（已实测，300 条）
 
-10 条探针查询，**MiniLM 有 5 条 top1 命中错误文档，且错误全部指向
-`health_insurance.md`** —— 英文模型在中文语料上退化为"总返回同一文档"，
-即随机排序的典型表现。bge-small-zh-v1.5 全部命中正确文档。
-
-| 查询 | MiniLM top1 | bge top1 |
+| variant | R@5 | P50 ms |
 |---|---|---|
-| 宠物可以带到公司吗 | remote_work ✗ | pet_policy ✓ |
-| 在家上班一周能几天 | health_insurance ✗ | remote_work ✓ |
-| 头晕怎么办 | health_insurance ✗ | Daily_Log ✓ |
-| 船舶总布置图含哪些舱室 | health_insurance ✗ | General_Arrangement ✓ |
-| 船员出差住宿标准 | health_insurance ✗ | Charter_Party_Rider ✓ |
+| vector_minilm | 0.023 | 16.5 |
+| vector_bge | **0.707** | 15.1 |
+| bm25 | 0.586 | 42.5 |
+| rrf | 0.708 | 52.1 |
+| rrf_rerank | 0.770* | 18974.6 |
 
-无答案类：MiniLM 给 0.875 / 0.809，bge 降到 0.703 / 0.723。方向正确但
-**仍高于 `ANSWERABLE_MIN_RELEVANCE=0.50`** —— 见下方未解决问题。
+\* 24 条样本，仍在补跑
 
-注：relevance 绝对值在不同模型间不可比（分布不同）。bge 分数普遍略低但
-命中率显著更高，不矛盾。定量结论以 M1 评测集为准。
+**换 embedding 模型使 Recall@5 提升约 30 倍**（0.023 → 0.707）。
+MiniLM 在中文语料上 MRR@10 仅 0.058，等同随机排序。
 
-## 端到端验证
+**RRF 在本数据集上无增益**（0.708 vs 0.707），延迟涨 3.5 倍。
+原因是 T2Ranking 以语义匹配为主，BM25 对向量路无有效补充。
+这是诚实的负面结果，已写进报告并说明适用条件。
 
-`retrieve_advanced` 三条查询实测：
-- `rrf_score` 量级 0.031~0.033，符合 `1/(60+1)+1/(60+2)`，两路命中时累加
-- `retrieved_by=vector+bm25`，融合生效
-- **排序与展示确实分离**：某条查询 relevance 为 0.838/0.810/0.822（不单调），
-  rrf_score 为 0.03252/0.03178/0.03175（严格递减）。排序按 RRF，展示用 relevance
+**Rerank 增益真实但 CPU 延迟 18.9 秒**，不可线上使用。
+当前 `ENABLE_RERANK=false` 是正确默认。
 
-## 未解决问题（移交 M1）
+详见 `docs/eval/report.md`。
 
-**无答案识别在当前语料规模上无法工作。** "公司年会在哪个城市举办"（知识库
-确实没有）得到 relevance 0.692，高于阈值 0.50，会被判定为可答。
-根因是语料只有 59 chunk：BM25 对"公司"必然命中，向量侧总能找到最近邻。
-这不是调阈值能解决的，需要 M1 用评测集的 12 条无答案问题正面处理
-（阈值校准曲线 + 可能需要引入 answerability 判断）。
+## 未解决问题
+
+**无答案识别（M0 遗留，M1 T5 处理）**：`ANSWERABLE_MIN_RELEVANCE=0.50`
+在 59 chunk 小语料上拦不住无答案查询（"公司年会在哪个城市举办"得 0.692）。
+需要用 T2Ranking 构造无答案子集扫描阈值，画识别率/误拒率曲线取拐点。
+
+**RRF 未按 query 类型分层**：T2Ranking 不提供类型标注，
+因此无法验证"BM25 在关键词类查询上更强"这一假设。
 
 ## 向量库现状
 
 ```
-techcorp_docs__baai_bge_small_zh_v1_5    59   <- 当前默认（512 维）
-techcorp_docs__all_minilm_l6_v2          59   <- 对比基线（384 维）
-techcorp_docs                            21   <- 换指纹前的旧库，可安全删除
+eval_t2ranking__baai_bge_small_zh_v1_5   13536   <- 评测（bge）
+eval_t2ranking__all_minilm_l6_v2         13536   <- 评测（MiniLM 基线）
+techcorp_docs__baai_bge_small_zh_v1_5       59   <- 生产默认
+techcorp_docs__all_minilm_l6_v2             59   <- 生产对比基线
+techcorp_docs                               21   <- 换指纹前旧库，可删
 ```
+
+评测与生产物理隔离（前缀 `eval_`），否则生产检索会命中 T2Ranking 段落。
 
 ## 活跃决策
 
-- 编排层手写状态机，不引入 LangGraph（节点签名对齐 StateGraph 形状，M5 可选加 adapter）
+- 编排层手写状态机，不引入 LangGraph（节点签名对齐 StateGraph 形状）
 - 向量留在 ChromaDB，不引入 pgvector；PG 只存关系数据与轨迹
-- 阈值初值 0.35 / 0.50 为拍定值，M1 用数据校准（已确认 0.50 偏低）
+- 检索指标自研（确定性运算可单测），生成层用 Ragas 但必须人工抽检报一致率
+- 项目定位为通用可追溯 RAG 知识库研究 Agent，`data/documents/` 仅为 demo
 
 ## 待办观察（边界外）
 
-- `scripts/` 下 4 个历史调试脚本仍引用已删配置（`4_run_rag.py`、
-  `5_test_hybrid_rag.py`、`9_test_hybrid.py`、`7_test_rerank.py`），
-  运行会 ImportError。非产品代码，M1 前清理或归档。
-- `ingestion.ingest_directory` 用 `print(..., end="")` 与 UTF-8 wrapper 交互，
-  部分文件名不显示。仅影响日志观感。
-- 国内直连 HuggingFace 不稳定，MiniLM 重建耗时 10401s 几乎全在网络重试。
-  hf-mirror 首页可达但模型 API 路径不通。
-- `chat_service.py` 那段"查询 ≤20 字则注入 jieba 实体"的补救逻辑，
-  换中文模型后是否还需要，M1 用评测集验证后再决定去留。
+- `scripts/` 下 4 个历史调试脚本仍引用已删配置
+  （`4_run_rag.py`、`5_test_hybrid_rag.py`、`9_test_hybrid.py`、`7_test_rerank.py`），
+  运行会 ImportError。非产品代码，清理或归档。
+- `chat_service.py` 的"查询 ≤20 字则注入 jieba 实体"补救逻辑，
+  换中文模型后必要性需重新评估 —— 它当初是为了弥补 MiniLM 的失效。
+  同理 Multi-Query 扩展与已删的 Query Rewrite。
+- **requests 在 hf-mirror 上会退化到约 12 KB/s，curl 能跑 9 MB/s**。
+  大文件必须用 curl，已在 `t2ranking.py` 实现并记入 ADR-002。
+- 所有 `scripts/` 入口必须把 stdout 切 UTF-8，否则 Windows GBK 控制台
+  遇中文即 UnicodeEncodeError。
