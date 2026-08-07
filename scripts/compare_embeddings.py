@@ -111,7 +111,6 @@ def main() -> int:
         print("       对比可能不公平。建议用同一份文档分别重建。")
 
     col_width = 46
-    top1_improved = 0
     top1_same = 0
 
     for kind, query in PROBE_QUERIES:
@@ -144,8 +143,6 @@ def main() -> int:
             same_file = base_hits[0][0] == cand_hits[0][0]
             if same_file:
                 top1_same += 1
-            if delta > 0.01:
-                top1_improved += 1
             arrow = "上升" if delta > 0.01 else ("下降" if delta < -0.01 else "持平")
             print(
                 f"  top1 relevance: {b_rel:.3f} -> {c_rel:.3f} "
@@ -156,13 +153,27 @@ def main() -> int:
     print("=" * 100)
     print("汇总")
     print("=" * 100)
-    print(f"  探针查询数:            {len(PROBE_QUERIES)}")
-    print(f"  候选 top1 相关性更高:  {top1_improved}")
-    print(f"  两者 top1 命中同一文件: {top1_same}")
+    print(f"  探针查询数:              {len(PROBE_QUERIES)}")
+    print(f"  两者 top1 命中同一文件:  {top1_same}")
+    print(f"  top1 文件不同（需人工判断哪个对）: {len(PROBE_QUERIES) - top1_same}")
     print()
-    print("  注意：relevance 数值在不同模型间不可直接比较（分布不同），")
-    print("        真正要看的是 top1 命中的文件是否正确、无答案类是否得分偏低。")
-    print("        定量结论以 M1 评测集为准（Recall@5 / MRR@10 / nDCG@10）。")
+
+    # 无答案类查询的 top1 相关性应当偏低。这一项比命中率更能暴露问题：
+    # 分数虚高意味着系统会自信地拿无关文档编答案。
+    print("  无答案类查询的 top1 相关性（越低越好）:")
+    for kind, query in PROBE_QUERIES:
+        if kind != "无答案":
+            continue
+        b = base[query][0][1] if base[query] else 0.0
+        c = cand[query][0][1] if cand[query] else 0.0
+        print(f"    {query[:24]:<26} 基线 {b:.3f}  ->  候选 {c:.3f}")
+    print()
+    print("  判读方法：")
+    print("    1. relevance 绝对值在不同模型间不可比（分布不同），不要看谁分高。")
+    print("    2. 看 top1 命中的文件对不对 —— 这是唯一可靠的人工信号。")
+    print("    3. 看无答案类是否被压低。若仍高于 ANSWERABLE_MIN_RELEVANCE，")
+    print("       说明该阈值初值偏高，需用评测集校准。")
+    print("    4. 定量结论以 M1 评测集为准（Recall@5 / MRR@10 / nDCG@10）。")
 
     return 0
 

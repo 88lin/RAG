@@ -18,8 +18,8 @@
 
 纯函数，无 IO，无全局状态。
 """
-
-from typing import Any, Dict, List, Sequence, Tuple
+import math
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 # RRF 平滑常数，来自 Cormack et al. 2009 (SIGIR)。
 # 作用是压平头部名次差距：k=0 时第 1 名 1.0、第 2 名 0.5，头部权重过大；
@@ -30,7 +30,7 @@ RRF_K_DEFAULT = 60
 
 def compute_relevance(result: Dict[str, Any]) -> float:
     """计算单条检索结果的相关性，用于展示与阈值判断。
-
+    
     优先级：rerank_logit > cosine_distance > 无信息。
     rerank 优先的理由是 cross-encoder 让 query 与 doc 相互注意，
     比双塔向量的独立编码更准，是精排阶段的结论。
@@ -65,10 +65,34 @@ def compute_relevance(result: Dict[str, Any]) -> float:
            （对应 relevance 0.5），用 `or`/`if x` 会把它误判为缺失。
            这正是本模块要修掉的原始 bug。
     """
-    raise NotImplementedError(
-        "TODO(你来写): 见上方 4 条实现要求。"
-        "测试见 tests/test_scoring.py::TestComputeRelevance"
-    )
+
+    # bool 是 int 的子类，isinstance(True, int) 为真。
+    # 显式排除，避免 rerank_logit=True 被当成 1.0。
+    def _as_number(value: Any) -> Optional[float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    # 逐级回退：rerank_logit 存在但值不可用时，仍应尝试 cosine_distance，
+    # 而不是直接判定为"无信息"。
+    logit = _as_number(result.get("rerank_logit"))
+    if logit is not None:
+        # 分支处理正负号：logit 可达 ±11，极端值下朴素 exp(-x) 会 OverflowError。
+        # logit >= 0 时 exp(-logit) 收敛到 0；logit < 0 时改用 exp(logit)，同样收敛。
+        if logit >= 0:
+            return 1.0 / (1.0 + math.exp(-logit))
+        exp_logit = math.exp(logit)
+        return exp_logit / (1.0 + exp_logit)
+
+    distance = _as_number(result.get("cosine_distance"))
+    if distance is not None:
+        # 夹紧的是输出的 relevance，不是输入的距离。
+        # 余弦距离值域为 [0,2]，若先把距离夹到 [0,1]，则 [1,2] 区间的距离
+        # 会全部塌陷到 relevance=0.5 —— "完全相反"与"正交"变得同样相关，
+        # 且恰好卡在 ANSWERABLE_MIN_RELEVANCE 门槛上。
+        return max(0.0, min(1.0, 1.0 - distance / 2.0))
+
+    return 0.0
 
 
 def rrf_fuse(
@@ -108,7 +132,21 @@ def rrf_fuse(
            否则一路内重复即可刷分。跨路重复是正常累加。
         3. 排序需稳定，便于测试与复现。
     """
-    raise NotImplementedError(
-        "TODO(你来写): 见上方 3 条实现要求。"
-        "测试见 tests/test_scoring.py::TestRRFFuse"
-    )
+    if k <= 0:
+        raise ValueError(f"RRF 平滑常数 k 必须 > 0，当前为 {k}")
+
+    scores: Dict[str, float] = {}
+    for ranked_list in ranked_lists:
+        # 每路独立去重：同一路内重复出现的 doc_id 只按其最好排名计一次，
+        # 否则一路内重复即可刷分。跨路重复是正常累加。
+        seen: Set[str] = set()
+        for rank, doc_id in enumerate(ranked_list, start=1):
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+
+    # Python 的 sorted 是稳定排序，同分项保持首次出现顺序，便于测试与复现。
+    return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
