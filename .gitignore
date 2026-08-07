@@ -103,3 +103,8 @@ frontend-vue/node_modules/
 frontend-vue/dist/
 frontend-vue/dist-ssr/
 *.local
+
+# 评测原始数据与运行记录（体积大，可由脚本重建）
+data/eval/raw/
+data/eval/*.jsonl
+docs/eval/runs/*.jsonl
