@@ -163,6 +163,17 @@
               </span>
               <span class="text-xs text-slate-500 shrink-0">·</span>
               <span class="text-xs text-slate-500 shrink-0">{{ activeCitation.index }}号引用</span>
+              <!-- 相关性徽标。语义边界：这是"该 chunk 与查询有多相关"，
+                   不是"这句话被该 chunk 支持"（后者需 citation_verify） -->
+              <template v-if="activeCitation.relevance !== undefined">
+                <span class="text-xs text-slate-500 shrink-0">·</span>
+                <span
+                  :class="['text-xs font-mono shrink-0', relevanceColorClass(activeCitation.relevance)]"
+                  :title="`该证据与查询的相关性 ${activeCitation.relevance.toFixed(3)}（余弦相似度口径）`"
+                >
+                  {{ Math.round(activeCitation.relevance * 100) }}%
+                </span>
+              </template>
             </div>
             <button
               @click="closeCitationCard"
@@ -231,6 +242,8 @@ interface ContentPart {
   citationContent?: string;
   /** 引用文件名（来自后端 citationDetails） */
   citationFile?: string;
+  /** 该证据与查询的相关性，[0,1]（来自后端 citationDetails） */
+  citationRelevance?: number;
 }
 
 interface ActiveCitation {
@@ -238,6 +251,8 @@ interface ActiveCitation {
   content: string;
   sourceName: string;
   index: number;
+  /** 该证据与查询的相关性，[0,1]。undefined 表示后端未提供（如纯 BM25 检索） */
+  relevance?: number;
   triggerRect: DOMRect;
 }
 
@@ -319,6 +334,7 @@ const handleCitationClick = (event: MouseEvent, part: ContentPart) => {
     content,
     sourceName,
     index: part.index ?? 0,
+    relevance: part.citationRelevance,
     triggerRect,
   };
 
@@ -328,6 +344,19 @@ const handleCitationClick = (event: MouseEvent, part: ContentPart) => {
 
 const closeCitationCard = () => {
   activeCitation.value = null;
+};
+
+/**
+ * 相关性配色。阈值与后端 config 对齐：
+ *   ANSWERABLE_MIN_RELEVANCE = 0.75  足以支撑基于文档的回答
+ *   RETRIEVAL_MIN_RELEVANCE  = 0.35  可进上下文但不足以判定可答
+ * 注意 0.75 这个值由评测校准得出（docs/eval/threshold.md），
+ * 且报告已说明单一阈值只能识别约两成无答案查询。
+ */
+const relevanceColorClass = (relevance: number): string => {
+  if (relevance >= 0.75) return 'text-neon-blue';
+  if (relevance >= 0.35) return 'text-amber-400';
+  return 'text-red-400';
 };
 
 // ─── 消息内容解析 ──────────────────────────────────────────────────────────────
@@ -363,6 +392,7 @@ const parseMessageContent = (
     let index: number;
     let citationContent: string | undefined;
     let citationFile: string | undefined;
+    let citationRelevance: number | undefined;
 
     if (match[0].startsWith('[来源:')) {
       // 按出现顺序从 citationDetails 取（精准，不去重，与文本标记一一对应）
@@ -370,8 +400,10 @@ const parseMessageContent = (
       chunkId = detail?.chunkId ?? citations?.[citationCounter];
       citationContent = detail?.content;
       citationFile = detail?.file;
+      citationRelevance = detail?.relevance;
 
       // 降级：chunkId 存在但 content 为空时，从 chunkMap 补充
+      // 注意 chunkMap 没有 relevance，此路径下卡片不显示相关性
       if (!citationContent && chunkId && chunkMap?.[chunkId]) {
         citationContent = chunkMap[chunkId].content;
         citationFile = citationFile || chunkMap[chunkId].sourceName;
@@ -386,10 +418,19 @@ const parseMessageContent = (
       chunkId = detail?.chunkId ?? citations?.[n - 1];
       citationContent = detail?.content;
       citationFile = detail?.file;
+      citationRelevance = detail?.relevance;
       index = n;
     }
 
-    parts.push({ type: 'citation', content: match[0], chunkId, index, citationContent, citationFile });
+    parts.push({
+      type: 'citation',
+      content: match[0],
+      chunkId,
+      index,
+      citationContent,
+      citationFile,
+      citationRelevance,
+    });
     lastIndex = match.index + match[0].length;
   }
 

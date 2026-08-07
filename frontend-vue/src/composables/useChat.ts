@@ -145,7 +145,9 @@ export function useChat(logs: Ref<LogEntry[]>, onCitationsReceived?: (chunkIds: 
             chunkId: c.chunk_id || c.doc_id || '',
             file: c.file || 'unknown',
             category: c.category || '',
-            content: c.content || ''
+            content: c.content || '',
+            // 后端已下发，此前前端未接导致引用卡片看不到相关性
+            relevance: typeof c.relevance === 'number' ? c.relevance : undefined
           }));
 
           // 触发 chunk 高亮（去重，只高亮唯一的 chunk）

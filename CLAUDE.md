@@ -15,11 +15,13 @@
 按顺序读：
 
 1. `CLAUDE.md`（本文件）
-2. `README.md`
-3. `STATUS.md`
-4. `docs/handoffs/LATEST.md`
+2. `docs/ROADMAP.md` —— 全局蓝图、阶段依赖、已定决策
+3. `STATUS.md` —— 当前位置与阻塞项
+4. `docs/handoffs/LATEST.md` —— 上次会话交接
 5. `STATUS.md` 指向的当前阶段 `docs/plans/M{n}-*.md`
 6. `git log --oneline -10` + `git status` + 未提交 diff
+
+`README.md` 是给外部读者的，只在改动它本身时读。
 
 ## 工作循环：Plan → Implement → Validate → Review → Record
 

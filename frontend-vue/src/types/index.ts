@@ -39,6 +39,12 @@ export interface CitationDetail {
   file: string;
   category: string;
   content: string;
+  /**
+   * 该证据与查询的相关性，[0,1] 越大越相关，由 rag/scoring.py 统一计算。
+   * 注意语义边界：这是"该 chunk 与查询有多相关"，
+   * 不是"这句话真的被该 chunk 支持" —— 后者需要 citation_verify（M3）。
+   */
+  relevance?: number;
 }
 
 // 日志条目
