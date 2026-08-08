@@ -81,31 +81,18 @@
             class="text-sm leading-relaxed whitespace-pre-wrap"
           >{{ msg.content }}</div>
 
-          <!-- AI 消息：渲染 markdown，并把 [n] 角标还原为可点击元素 -->
-          <div v-else class="text-sm leading-relaxed markdown-body">
-            <template
-              v-for="(part, i) in renderAiMessage(msg)"
-              :key="i"
-            >
-              <span v-if="part.type === 'html'" v-html="part.html" />
-              <!-- 来源角标：紧凑上标数字。
-                   同一 chunk 被引多次共享同一编号（后端按 chunk_id 去重）。 -->
-              <sup
-                v-else
-                :class="[
-                  'inline-block mx-0.5 px-0.5 font-mono font-bold',
-                  'text-[0.7rem] leading-none cursor-pointer rounded',
-                  'transition-colors duration-200 select-none',
-                  activeCitation?.index === part.number
-                    ? 'text-deep-950 bg-neon-blue'
-                    : 'text-neon-blue hover:bg-neon-blue/25'
-                ]"
-                @click.stop="handleNumberClick($event, msg, part.number)"
-                @mouseenter="emitHoverByNumber(msg, part.number)"
-                @mouseleave="$emit('citationHover', null)"
-              >[{{ part.number }}]</sup>
-            </template>
-          </div>
+          <!-- AI 消息：整块 v-html 渲染 markdown，角标已内联在 HTML 中。
+               不拆成多个片段渲染 —— 角标通常在 <p> 内部，拆分会产出
+               未闭合的块级标签，浏览器自动闭合后角标被挤到下一行。
+               点击与悬停用事件委托处理。 -->
+          <div
+            v-else
+            class="text-sm leading-relaxed markdown-body"
+            v-html="renderAiMessage(msg)"
+            @click="handleMarkdownClick($event, msg)"
+            @mouseover="handleMarkdownHover($event, msg)"
+            @mouseout="$emit('citationHover', null)"
+          />
 
           <!-- 末尾来源列表：正文只留紧凑角标，文件名集中在这里，
                避免同一来源在正文中反复出现长文本 -->
@@ -188,14 +175,16 @@
     <!-- 来源悬浮卡片（Teleport 到 body，避免被 overflow:hidden 裁切） -->
     <Teleport to="body">
       <Transition name="citation-card">
+        <!-- flex-col + 内容区 flex-1 是关键：卡片有 maxHeight 约束时，
+             只有这样内容区才会收缩并出现滚动条，否则内容溢出被裁掉。 -->
         <div
           v-if="activeCitation"
-          class="fixed z-[9999] w-96 max-w-[calc(100vw-2rem)] bg-deep-900 border border-neon-blue/40 rounded-xl shadow-2xl shadow-black/60 overflow-hidden"
+          class="fixed z-[9999] w-96 max-w-[calc(100vw-2rem)] flex flex-col bg-deep-900 border border-neon-blue/40 rounded-xl shadow-2xl shadow-black/60 overflow-hidden"
           :style="cardPositionStyle"
           @click.stop
         >
-          <!-- 卡片顶部：来源信息 -->
-          <div class="flex items-center justify-between px-4 py-3 bg-neon-blue/10 border-b border-neon-blue/20">
+          <!-- 卡片顶部：来源信息。shrink-0 防止被内容区挤压 -->
+          <div class="shrink-0 flex items-center justify-between px-4 py-3 bg-neon-blue/10 border-b border-neon-blue/20">
             <div class="flex items-center gap-2 min-w-0">
               <FileText :size="14" class="text-neon-blue shrink-0" />
               <span class="text-xs font-mono text-neon-blue truncate" :title="activeCitation.sourceName">
@@ -222,7 +211,7 @@
                不是"这句话被该 chunk 支持"（后者需 M3 的 citation_verify）。 -->
           <div
             v-if="activeCitation.relevance !== undefined"
-            class="px-4 py-3 border-b border-deep-800 bg-black/20 space-y-2"
+            class="shrink-0 px-4 py-3 border-b border-deep-800 bg-black/20 space-y-2"
           >
             <div class="flex items-baseline justify-between gap-2">
               <span class="text-[0.7rem] uppercase tracking-wider text-slate-500 font-mono">
@@ -250,22 +239,33 @@
             </p>
           </div>
 
-          <!-- 卡片主体：文档内容 -->
-          <div class="p-4 max-h-64 overflow-y-auto">
+          <!-- 卡片主体：文档内容。flex-1 + min-h-0 让它吸收剩余高度并可滚动。
+               min-h-0 是必需的 —— flex 子项默认 min-height:auto，
+               不设置会导致内容撑开父容器而非出现滚动条。 -->
+          <div class="flex-1 min-h-0 overflow-y-auto p-4">
             <div class="text-[0.7rem] uppercase tracking-wider text-slate-600 font-mono mb-2">
               原文片段
             </div>
-            <p class="text-sm text-slate-300 leading-relaxed font-mono whitespace-pre-wrap">{{ activeCitation.content }}</p>
+            <!-- 用无衬线字体 + pre-wrap：保留原文换行（表格与列表靠它对齐），
+                 但不用等宽字体 —— 中文等宽字体渲染差且行长参差。
+                 break-words 防止长 URL 撑破卡片宽度。 -->
+            <p class="text-[0.8rem] text-slate-300 leading-relaxed whitespace-pre-wrap break-words">{{ activeCitation.content }}</p>
           </div>
 
           <!-- 卡片底部：chunk ID -->
-          <div class="px-4 py-2 bg-black/30 border-t border-deep-800">
-            <span class="text-xs text-slate-600 font-mono">chunk: {{ activeCitation.chunkId }}</span>
+          <div class="shrink-0 px-4 py-2 bg-black/30 border-t border-deep-800">
+            <span class="text-xs text-slate-600 font-mono break-all">chunk: {{ activeCitation.chunkId }}</span>
           </div>
 
-          <!-- 向上三角箭头（指向角标） -->
+          <!-- 三角箭头，方向随卡片展开方向翻转 -->
           <div
+            v-if="cardPlacedBelow"
             class="absolute -top-2 border-8 border-transparent border-b-neon-blue/40"
+            :style="{ left: `${arrowLeft}px` }"
+          />
+          <div
+            v-else
+            class="absolute -bottom-2 border-8 border-transparent border-t-neon-blue/40"
             :style="{ left: `${arrowLeft}px` }"
           />
         </div>
@@ -278,7 +278,7 @@
 import { ref, computed, watch, nextTick } from 'vue';
 import { Send, Zap, Shield, User, Bot, AlertTriangle, FileText, X } from 'lucide-vue-next';
 import type { Message, CitationDetail } from '@/types';
-import { renderWithCitations, type RenderedPart } from '@/utils/markdown';
+import { renderMarkdown, citationNumberFromEvent } from '@/utils/markdown';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -343,24 +343,63 @@ const activeCitation = ref<ActiveCitation | null>(null);
 
 /** 卡片宽度（px），需与模板宽度 w-96(384px) 对应 */
 const CARD_WIDTH = 384;
-/** 卡片出现在角标下方的间距 */
+/** 卡片与角标之间的间距 */
 const CARD_OFFSET_Y = 10;
+/** 卡片与视口边缘的最小留白 */
+const VIEWPORT_MARGIN = 12;
 
+/**
+ * 卡片定位。
+ *
+ * 此前用硬编码的 300px 估算卡片高度来决定放上方还是下方，
+ * 内容变多（新增相关性说明区）后卡片超出视口，
+ * top 被钉在 8px、底部被裁掉且无法滚动 —— 因为卡片本身没有高度约束，
+ * 只有内容区设了 max-h-64。
+ *
+ * 改为：不猜高度，直接给卡片设视口相对的 maxHeight，
+ * 由卡片自身滚动。上/下方向按可用空间较大的一侧选择。
+ */
 const cardPositionStyle = computed(() => {
   if (!activeCitation.value) return {};
   const r = activeCitation.value.triggerRect;
 
-  // 水平：优先居中于角标，超出屏幕右侧则靠右
+  // 水平：优先居中于角标，超出视口则贴边
   let left = r.left + r.width / 2 - CARD_WIDTH / 2;
-  left = Math.max(8, Math.min(left, window.innerWidth - CARD_WIDTH - 8));
+  left = Math.max(
+    VIEWPORT_MARGIN,
+    Math.min(left, window.innerWidth - CARD_WIDTH - VIEWPORT_MARGIN)
+  );
 
-  // 垂直：默认在角标下方；空间不足时改为上方
-  const spaceBelow = window.innerHeight - r.bottom;
-  const top = spaceBelow > 280
-    ? r.bottom + CARD_OFFSET_Y
-    : r.top - CARD_OFFSET_Y - 300; // 大约 max-h-64 + header + footer
+  const spaceBelow = window.innerHeight - r.bottom - CARD_OFFSET_Y - VIEWPORT_MARGIN;
+  const spaceAbove = r.top - CARD_OFFSET_Y - VIEWPORT_MARGIN;
+  const placeBelow = spaceBelow >= spaceAbove;
 
-  return { left: `${left}px`, top: `${Math.max(8, top)}px` };
+  // 可用高度取所选方向的空间，并留一个下限避免极端窄屏下卡片过扁
+  const available = Math.max(180, placeBelow ? spaceBelow : spaceAbove);
+
+  if (placeBelow) {
+    return {
+      left: `${left}px`,
+      top: `${r.bottom + CARD_OFFSET_Y}px`,
+      maxHeight: `${available}px`,
+    };
+  }
+
+  // 向上展开时用 bottom 定位，卡片增高不会盖住角标
+  return {
+    left: `${left}px`,
+    bottom: `${window.innerHeight - r.top + CARD_OFFSET_Y}px`,
+    maxHeight: `${available}px`,
+  };
+});
+
+/** 箭头方向：卡片在下方时箭头朝上，反之朝下 */
+const cardPlacedBelow = computed(() => {
+  if (!activeCitation.value) return true;
+  const r = activeCitation.value.triggerRect;
+  const spaceBelow = window.innerHeight - r.bottom - CARD_OFFSET_Y - VIEWPORT_MARGIN;
+  const spaceAbove = r.top - CARD_OFFSET_Y - VIEWPORT_MARGIN;
+  return spaceBelow >= spaceAbove;
 });
 
 /** 三角箭头在卡片内的水平偏移 */
@@ -438,27 +477,28 @@ const detailByNumber = (msg: Message, n: number): CitationDetail | undefined =>
   msg.citationDetails?.find((d, i) => (d.number ?? i + 1) === n);
 
 /**
- * 渲染 AI 消息：markdown 转 HTML（已净化）并把 [n] 拆成独立片段。
+ * 渲染 AI 消息为 HTML（已净化），角标内联为 <sup data-citation>。
  *
- * 流式过程中 content 会不断增长，每次都重新渲染。marked 对这个量级的
- * 文本足够快，不做缓存以避免流式时显示滞后。
+ * 流式过程中 content 不断增长，每次重新渲染。marked 对这个量级足够快，
+ * 不做缓存以避免流式时显示滞后。
  */
-const renderAiMessage = (msg: Message): RenderedPart[] => renderWithCitations(msg.content);
+const renderAiMessage = (msg: Message): string => renderMarkdown(msg.content);
 
-const handleNumberClick = (event: MouseEvent, msg: Message, n: number) => {
+/** 事件委托：点击正文中的角标 */
+const handleMarkdownClick = (event: MouseEvent, msg: Message) => {
+  const n = citationNumberFromEvent(event);
+  if (n === null) return;
+  event.stopPropagation();
   const detail = detailByNumber(msg, n);
-  if (!detail) return;
-  handleSourceListClick(event, detail);
+  if (detail) handleSourceListClick(event, detail);
 };
 
-const emitHoverByNumber = (msg: Message, n: number) => {
+/** 事件委托：悬停角标时高亮左侧对应 chunk */
+const handleMarkdownHover = (event: MouseEvent, msg: Message) => {
+  const n = citationNumberFromEvent(event);
+  if (n === null) return;
   const chunkId = detailByNumber(msg, n)?.chunkId;
   if (chunkId) emit('citationHover', chunkId);
-};
-
-const titleForNumber = (msg: Message, n: number): string => {
-  const detail = detailByNumber(msg, n);
-  return detail ? `来源：${detail.file}（点击查看原文）` : '';
 };
 
 /**
@@ -610,27 +650,58 @@ const handleSubmit = () => {
   color: #94a3b8;
 }
 
-/* 表格：模型常用表格作对比，不设边框会完全对不齐 */
+/* 引用角标。样式必须写在这里而非 Tailwind class ——
+   角标由 markdown.ts 生成的 HTML 携带，Tailwind 的 JIT
+   扫不到动态字符串里的类名，写在模板里的 class 不会生效。 */
+.markdown-body :deep(.citation-marker) {
+  display: inline;
+  margin: 0 0.1em;
+  padding: 0 0.15em;
+  border-radius: 0.2rem;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.7em;
+  font-weight: 700;
+  line-height: 1;
+  color: #22d3ee;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  /* vertical-align 用 super 而非默认，避免影响行高造成行距不均 */
+  vertical-align: super;
+}
+.markdown-body :deep(.citation-marker:hover) {
+  background: rgba(6, 182, 212, 0.25);
+}
+
+/* 表格：模型常用表格作对比。
+   此前设了 white-space: nowrap 且 display: block，
+   导致长内容把列宽撑爆、各行对不齐。
+   改为 table-layout: fixed + 允许换行，列宽由浏览器均分。 */
 .markdown-body :deep(table) {
-  margin: 0.6em 0;
+  width: 100%;
+  margin: 0.7em 0;
   border-collapse: collapse;
-  font-size: 0.92em;
-  display: block;
-  overflow-x: auto;
-  max-width: 100%;
+  table-layout: fixed;
+  font-size: 0.88em;
 }
 .markdown-body :deep(th),
 .markdown-body :deep(td) {
-  padding: 0.35em 0.7em;
+  padding: 0.4em 0.6em;
   border: 1px solid rgba(148, 163, 184, 0.22);
   text-align: left;
   vertical-align: top;
+  /* 长英文/URL 不换行会撑破布局 */
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 .markdown-body :deep(th) {
   background: rgba(6, 182, 212, 0.08);
   font-weight: 600;
   color: #e2e8f0;
-  white-space: nowrap;
+}
+/* 表格内的段落不要额外外边距，否则单元格高度参差 */
+.markdown-body :deep(td p),
+.markdown-body :deep(th p) {
+  margin: 0;
 }
 
 .markdown-body :deep(hr) {

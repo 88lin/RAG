@@ -111,19 +111,24 @@
           <div v-if="!file.chunksLoaded" class="text-xs p-2 text-slate-500 font-mono">
             加载中...
           </div>
+          <!-- chunk 预览。
+               原文常含 markdown 表格与多级缩进，直接 substring(0,80)
+               会在任意位置截断，配合 font-mono 显示为错乱的字符堆。
+               改为先压缩连续空白为单空格，再限制两行并用 title 提供全文。 -->
           <div
             v-else
             v-for="(chunk, idx) in file.chunks"
             :key="chunk.id"
             :class="[
-              'text-xs p-2 rounded font-mono leading-relaxed transition-all duration-500',
+              'text-xs p-2 rounded leading-relaxed transition-all duration-500 flex gap-2',
               highlightedChunkIds?.has(chunk.id)
                 ? 'bg-neon-blue/20 border border-neon-blue/50 text-neon-blue shadow-[0_0_15px_rgba(6,182,212,0.2)]'
                 : 'text-slate-500 border border-transparent hover:bg-deep-800'
             ]"
+            :title="chunk.content"
           >
-            <span class="opacity-50 select-none mr-2">[{{ idx + 1 }}]</span>
-            {{ chunk.content.substring(0, 80) }}...
+            <span class="opacity-50 select-none font-mono shrink-0">[{{ idx + 1 }}]</span>
+            <span class="chunk-preview">{{ previewText(chunk.content) }}</span>
           </div>
         </div>
       </div>
@@ -194,4 +199,29 @@ const getFileIconColor = (type: string) => {
     default: return 'text-slate-400';
   }
 };
+
+/**
+ * chunk 预览文本。
+ *
+ * 压缩连续空白（换行、制表、多空格）为单空格：chunk 原文常含
+ * markdown 表格分隔行与多级缩进，保留原样会在窄侧栏里显示为
+ * 对不齐的字符堆。截断交给 CSS 的 line-clamp，
+ * 不在 JS 里按字符数硬切 —— 那样会切断中文词与 markdown 标记。
+ */
+const previewText = (content: string): string =>
+  content.replace(/\s+/g, ' ').trim();
 </script>
+
+<style scoped>
+/* 限制两行并省略。用 line-clamp 而非 JS 截断，
+   浏览器按实际渲染宽度决定断点，中英文混排都不会切坏。 */
+.chunk-preview {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+</style>
