@@ -46,3 +46,8 @@ jieba>=0.42.1
 # ==================== 测试 ====================
 pytest==8.0.0
 pytest-asyncio==0.23.5
+
+# 注：评测（rag/eval/）只用上面这些依赖，不需要 ragas。
+# 忠实度判分自己实现，原因见 docs/eval/report.md 第 7 节 ——
+# ragas 0.1.x 按 temperature=1e-8 调用（智谱拒绝该值），
+# 且其英文 prompt 使 GLM 把 JSON 包在 markdown 代码块里导致断言抽取失败。
