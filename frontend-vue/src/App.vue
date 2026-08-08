@@ -23,6 +23,7 @@
           :is-rag-enabled="isRagEnabled"
           :is-thinking="isThinking"
           :chunk-map="chunkMap"
+          :relevance-basis="relevanceBasis"
           @toggle-rag="toggleRag"
           @send-message="handleSendMessage"
           @citation-hover="handleCitationHover"

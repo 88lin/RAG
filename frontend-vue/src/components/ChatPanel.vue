@@ -93,18 +93,17 @@
               <sup
                 v-else
                 :class="[
-                  'inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] mx-0.5',
-                  'text-[0.65rem] font-bold leading-none cursor-pointer rounded',
-                  'transition-all duration-200 select-none',
+                  'inline-block mx-0.5 px-0.5 font-mono font-bold',
+                  'text-[0.7rem] leading-none cursor-pointer rounded',
+                  'transition-colors duration-200 select-none',
                   activeCitation?.index === part.number
-                    ? 'bg-neon-blue text-deep-950 shadow-[0_0_6px_rgba(6,182,212,0.6)]'
-                    : 'bg-neon-blue/15 text-neon-blue hover:bg-neon-blue/35'
+                    ? 'text-deep-950 bg-neon-blue'
+                    : 'text-neon-blue hover:bg-neon-blue/25'
                 ]"
                 @click.stop="handleNumberClick($event, msg, part.number)"
                 @mouseenter="emitHoverByNumber(msg, part.number)"
                 @mouseleave="$emit('citationHover', null)"
-                :title="titleForNumber(msg, part.number)"
-              >{{ part.number }}</sup>
+              >[{{ part.number }}]</sup>
             </template>
           </div>
 
@@ -125,8 +124,8 @@
               @mouseenter="detail.chunkId && $emit('citationHover', detail.chunkId)"
               @mouseleave="$emit('citationHover', null)"
             >
-              <span class="inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] rounded bg-neon-blue/15 text-neon-blue text-[0.65rem] font-bold shrink-0">
-                {{ detail.number }}
+              <span class="font-mono text-neon-blue text-[0.7rem] font-bold shrink-0">
+                [{{ detail.number }}]
               </span>
               <span class="font-mono text-slate-400 group-hover:text-neon-blue transition-colors truncate">
                 {{ detail.file }}
@@ -134,9 +133,8 @@
               <span
                 v-if="detail.relevance !== undefined"
                 :class="['font-mono text-[0.65rem] shrink-0', relevanceColorClass(detail.relevance)]"
-                :title="`该证据与查询的相关性 ${detail.relevance.toFixed(3)}`"
               >
-                {{ Math.round(detail.relevance * 100) }}%
+                ({{ Math.round(detail.relevance * 100) }}%)
               </span>
             </div>
           </div>
@@ -204,18 +202,9 @@
                 {{ activeCitation.sourceName }}
               </span>
               <span class="text-xs text-slate-500 shrink-0">·</span>
-              <span class="text-xs text-slate-500 shrink-0">{{ activeCitation.index }}号引用</span>
-              <!-- 相关性徽标。语义边界：这是"该 chunk 与查询有多相关"，
-                   不是"这句话被该 chunk 支持"（后者需 citation_verify） -->
-              <template v-if="activeCitation.relevance !== undefined">
-                <span class="text-xs text-slate-500 shrink-0">·</span>
-                <span
-                  :class="['text-xs font-mono shrink-0', relevanceColorClass(activeCitation.relevance)]"
-                  :title="`该证据与查询的相关性 ${activeCitation.relevance.toFixed(3)}（余弦相似度口径）`"
-                >
-                  {{ Math.round(activeCitation.relevance * 100) }}%
-                </span>
-              </template>
+              <span class="text-xs font-mono text-slate-500 shrink-0">
+                [{{ activeCitation.index }}]
+              </span>
             </div>
             <button
               @click="closeCitationCard"
@@ -226,8 +215,46 @@
             </button>
           </div>
 
+          <!-- 相关性说明区。
+               不用 tooltip：一个百分比脱离口径说明是不可解释的，
+               而 title 属性既不能常驻也无法排版。
+               语义边界要写清 —— 这是"该 chunk 与查询有多相关"，
+               不是"这句话被该 chunk 支持"（后者需 M3 的 citation_verify）。 -->
+          <div
+            v-if="activeCitation.relevance !== undefined"
+            class="px-4 py-3 border-b border-deep-800 bg-black/20 space-y-2"
+          >
+            <div class="flex items-baseline justify-between gap-2">
+              <span class="text-[0.7rem] uppercase tracking-wider text-slate-500 font-mono">
+                {{ relevanceBasisLabel }}
+              </span>
+              <span :class="['text-lg font-bold font-mono', relevanceColorClass(activeCitation.relevance)]">
+                {{ Math.round(activeCitation.relevance * 100) }}%
+              </span>
+            </div>
+
+            <!-- 进度条：数值的视觉锚点，比裸数字更快读出高低 -->
+            <div class="h-1 rounded-full bg-deep-800 overflow-hidden">
+              <div
+                class="h-full rounded-full transition-all duration-500"
+                :class="relevanceBarClass(activeCitation.relevance)"
+                :style="{ width: `${Math.round(activeCitation.relevance * 100)}%` }"
+              />
+            </div>
+
+            <p class="text-[0.7rem] text-slate-500 leading-relaxed">
+              {{ relevanceExplain }}
+              <span class="text-slate-600">
+                原始值 {{ activeCitation.relevance.toFixed(3) }}
+              </span>
+            </p>
+          </div>
+
           <!-- 卡片主体：文档内容 -->
           <div class="p-4 max-h-64 overflow-y-auto">
+            <div class="text-[0.7rem] uppercase tracking-wider text-slate-600 font-mono mb-2">
+              原文片段
+            </div>
             <p class="text-sm text-slate-300 leading-relaxed font-mono whitespace-pre-wrap">{{ activeCitation.content }}</p>
           </div>
 
@@ -266,6 +293,8 @@ interface Props {
   isThinking: boolean;
   /** chunkId → { content, sourceName } 映射（降级用，主要路径是 citationDetails） */
   chunkMap?: Record<string, ChunkInfo>;
+  /** relevance 的计算依据，决定引用卡片里那个百分比的物理含义 */
+  relevanceBasis?: 'rerank' | 'cosine' | null;
 }
 
 interface Emits {
@@ -444,6 +473,30 @@ const relevanceColorClass = (relevance: number): string => {
   if (relevance >= 0.35) return 'text-amber-400';
   return 'text-red-400';
 };
+
+const relevanceBarClass = (relevance: number): string => {
+  if (relevance >= 0.75) return 'bg-neon-blue';
+  if (relevance >= 0.35) return 'bg-amber-400';
+  return 'bg-red-400';
+};
+
+/** 标题写明这个百分比是什么量，而不是含糊的"相关性" */
+const relevanceBasisLabel = computed(() =>
+  props.relevanceBasis === 'rerank' ? '精排相关概率' : '余弦相似度'
+);
+
+/**
+ * 口径解释。两条映射的物理依据不同，必须分别说明：
+ *   rerank —— bge-reranker 以二分类交叉熵训练，logit 过 sigmoid
+ *             就是模型自身估计的相关概率，是模型原生语义
+ *   cosine —— 归一化向量的余弦距离线性映射到 [0,1]
+ */
+const relevanceExplain = computed(() => {
+  if (props.relevanceBasis === 'rerank') {
+    return '由 cross-encoder 对（问题, 片段）联合打分后取 sigmoid，即模型估计的相关概率。';
+  }
+  return '由问题与片段的向量余弦距离换算（1 - d/2）。衡量语义接近程度，不等于该片段支持了这句话。';
+});
 
 
 // ─── 自动滚动 ──────────────────────────────────────────────────────────────────
