@@ -447,6 +447,18 @@ class ChatService:
         buffer = ""
         full_prompt = ""
 
+        # 角标编号按 chunk_id 去重：同一 chunk 被引多次共享同一编号。
+        # 此前每个 [doc_X] 都替换成 "[来源: 文件名]"，同一 chunk 引三次
+        # 就出现三段冗长重复的文本，占版面且不传达新信息。
+        chunk_to_number = {}
+        # citations 与角标编号一一对应，每个编号只推一条
+        emitted_numbers = set()
+
+        def number_for(chunk_id: str) -> int:
+            if chunk_id not in chunk_to_number:
+                chunk_to_number[chunk_id] = len(chunk_to_number) + 1
+            return chunk_to_number[chunk_id]
+
         async for chunk in _sync_generator_to_async(
             lambda: self.llm.answer_with_citations_stream(
                 question, results, conversation_context
@@ -467,25 +479,32 @@ class ChatService:
             if match:
                 doc_id = f"doc_{match.group(1)}"
                 doc_info = doc_map.get(doc_id, {})
-                file_name = doc_info.get('file', 'unknown')
-
                 pre_match = buffer[:match.start()]
-                replacement = f" [来源: {file_name}]"
-                output_chunk = pre_match + replacement
-                yield {"type": "answer_chunk", "data": {"content": output_chunk}}
 
-                # 🎯 按引用出现顺序追加（不去重），前端通过索引精准定位每条引用
-                chunk_id = doc_info.get('chunk_id', doc_id)
                 if doc_info:
-                    citations.append({
-                        "chunk_id": chunk_id,
-                        "doc_id": doc_id,
-                        "file": file_name,
-                        "category": doc_info.get('category', 'unknown'),
-                        "content": doc_info.get('content', ''),
-                        "relevance": doc_info.get('relevance', 0.0)
-                    })
+                    chunk_id = doc_info.get('chunk_id', doc_id)
+                    number = number_for(chunk_id)
+                    # 只输出紧凑角标，不拼文件名 —— 呈现形式交给前端，
+                    # 后端塞长文本会让展示层无法改样式
+                    output_chunk = pre_match + f"[{number}]"
 
+                    # 每个编号只推一条 citation，前端据 number 建立映射
+                    if number not in emitted_numbers:
+                        emitted_numbers.add(number)
+                        citations.append({
+                            "number": number,
+                            "chunk_id": chunk_id,
+                            "doc_id": doc_id,
+                            "file": doc_info.get('file', 'unknown'),
+                            "category": doc_info.get('category', 'unknown'),
+                            "content": doc_info.get('content', ''),
+                            "relevance": doc_info.get('relevance', 0.0),
+                        })
+                else:
+                    # 模型引用了不存在的 doc_X，丢弃该标记而非原样输出
+                    output_chunk = pre_match
+
+                yield {"type": "answer_chunk", "data": {"content": output_chunk}}
                 buffer = buffer[match.end():]
 
             elif len(buffer) > 20 and '[' not in buffer[-10:]:

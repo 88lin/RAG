@@ -175,35 +175,65 @@ TechCorp允许员工每周五携带宠物来办公室[doc_1]。宠物必须性�
             if doc_id in doc_map:
                 cited_docs.add(doc_id)
 
-        # 创建引用对象（每个文档一个）
-        for doc_id in sorted(cited_docs):
-            doc = doc_map[doc_id]
+        # 按首次出现顺序给每个被引 chunk 分配稳定编号。
+        # 同一 chunk 多次被引用共享同一个编号 —— 这是关键：
+        # 此前每个 [doc_X] 都被替换成 "[来源: 文件名]"，同一 chunk 被引三次
+        # 就出现三段冗长且重复的文本，既占版面又不传达新信息。
+        #
+        # 编号按 chunk_id 而非 doc_X 去重：不同 doc_X 可能指向同一 chunk
+        # （检索返回重复项时），此时也应共享编号。
+        chunk_to_number: Dict[str, int] = {}
+        doc_to_number: Dict[str, int] = {}
+
+        for match in re.finditer(citation_pattern, response):
+            doc_id = f"doc_{match.group(1)}"
+            doc = doc_map.get(doc_id)
+            if doc is None:
+                continue
+            chunk_key = doc.get('id') or doc['metadata'].get('file', doc_id)
+            if chunk_key not in chunk_to_number:
+                chunk_to_number[chunk_key] = len(chunk_to_number) + 1
+            doc_to_number[doc_id] = chunk_to_number[chunk_key]
+
+        # citations 按编号顺序返回，前端据此渲染末尾来源列表。
+        # 每个编号只出现一条，不再按 doc_X 重复。
+        number_to_doc: Dict[int, str] = {}
+        for doc_id, number in doc_to_number.items():
+            number_to_doc.setdefault(number, doc_id)
+
+        for number in sorted(number_to_doc):
+            doc = doc_map[number_to_doc[number]]
             citations.append(Citation(
                 sentence="",  # 内联模式下不需要具体句子
-                source_doc=doc_id,
+                source_doc=number_to_doc[number],
                 source_file=doc['metadata'].get('file', 'unknown'),
                 confidence=1.0
             ))
 
-        # 格式化答案：将 [doc_X] 替换为更友好的显示
+        # 格式化答案：把 [doc_X] 换成紧凑角标 [n]。
+        # 只做编号映射，不拼接文件名 —— 呈现形式交给前端决定，
+        # 后端在这里塞长文本会让展示层无法改样式。
         def replace_citation(match):
             doc_id = f"doc_{match.group(1)}"
-            if doc_id in doc_map:
-                file_name = doc_map[doc_id]['metadata'].get('file', 'unknown')
-                return f" [来源: {file_name}]"
-            return match.group(0)
+            number = doc_to_number.get(doc_id)
+            return f"[{number}]" if number else ""
 
         formatted_answer = re.sub(citation_pattern, replace_citation, response)
 
         result = {
             'answer': response,  # 保留原始答案（带[doc_X]标记）
             'citations': citations,
-            'formatted_answer': formatted_answer,  # 格式化后的答案（[来源: xxx.md]）
+            'formatted_answer': formatted_answer,  # 紧凑角标形式 [1][2]
             'parse_success': True,
-            'cited_count': len(cited_docs)
+            'cited_count': len(chunk_to_number),
+            # doc_X -> 角标编号，供上层把 citations 与文本标记对齐
+            'doc_numbers': doc_to_number,
         }
 
-        logger.info(f"内联引用解析成功：引用了 {len(cited_docs)} 个文档")
+        logger.info(
+            f"内联引用解析成功：{len(chunk_to_number)} 个唯一 chunk，"
+            f"{len(doc_to_number)} 个 doc 编号"
+        )
         return result
 
     def parse_citation_response(

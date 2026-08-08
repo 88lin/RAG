@@ -74,29 +74,71 @@
             知识库检索
           </div>
 
-          <!-- Message Content with Citations -->
-          <div class="text-sm leading-relaxed whitespace-pre-wrap">
-            <template v-for="(part, i) in parseMessageContent(msg.content, msg.citations, msg.citationDetails, props.chunkMap)" :key="i">
-              <span
-                v-if="part.type === 'text'"
-              >{{ part.content }}</span>
-              <!-- 来源角标：可点击，弹出悬浮卡片 -->
-              <span
+          <!-- 用户消息：纯文本。不渲染用户输入的 markdown ——
+               用户打的 * 或 # 应当原样显示，那是内容不是格式。 -->
+          <div
+            v-if="msg.role === 'user'"
+            class="text-sm leading-relaxed whitespace-pre-wrap"
+          >{{ msg.content }}</div>
+
+          <!-- AI 消息：渲染 markdown，并把 [n] 角标还原为可点击元素 -->
+          <div v-else class="text-sm leading-relaxed markdown-body">
+            <template
+              v-for="(part, i) in renderAiMessage(msg)"
+              :key="i"
+            >
+              <span v-if="part.type === 'html'" v-html="part.html" />
+              <!-- 来源角标：紧凑上标数字。
+                   同一 chunk 被引多次共享同一编号（后端按 chunk_id 去重）。 -->
+              <sup
                 v-else
                 :class="[
-                  'inline-block mx-1 text-xs font-bold cursor-pointer rounded px-1.5 py-0.5 transition-all duration-200 select-none',
-                  activeCitation?.chunkId === part.chunkId
-                    ? 'bg-neon-blue text-deep-950 shadow-[0_0_8px_rgba(6,182,212,0.5)]'
-                    : 'text-neon-blue border border-neon-blue/40 hover:bg-neon-blue/20 hover:border-neon-blue'
+                  'inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] mx-0.5',
+                  'text-[0.65rem] font-bold leading-none cursor-pointer rounded',
+                  'transition-all duration-200 select-none',
+                  activeCitation?.index === part.number
+                    ? 'bg-neon-blue text-deep-950 shadow-[0_0_6px_rgba(6,182,212,0.6)]'
+                    : 'bg-neon-blue/15 text-neon-blue hover:bg-neon-blue/35'
                 ]"
-                @click.stop="handleCitationClick($event, part)"
-                @mouseenter="part.chunkId && $emit('citationHover', part.chunkId)"
+                @click.stop="handleNumberClick($event, msg, part.number)"
+                @mouseenter="emitHoverByNumber(msg, part.number)"
                 @mouseleave="$emit('citationHover', null)"
-                :title="part.chunkId ? '点击查看文档证据' : ''"
-              >
-                {{ part.content }}
-              </span>
+                :title="titleForNumber(msg, part.number)"
+              >{{ part.number }}</sup>
             </template>
+          </div>
+
+          <!-- 末尾来源列表：正文只留紧凑角标，文件名集中在这里，
+               避免同一来源在正文中反复出现长文本 -->
+          <div
+            v-if="msg.role === 'ai' && msg.citationDetails?.length"
+            class="mt-3 pt-2 border-t border-deep-800/80 space-y-1"
+          >
+            <div class="text-[0.65rem] uppercase tracking-wider text-slate-600 font-mono mb-1">
+              引用来源
+            </div>
+            <div
+              v-for="detail in msg.citationDetails"
+              :key="detail.number ?? detail.chunkId"
+              class="flex items-center gap-2 text-xs cursor-pointer group"
+              @click="handleSourceListClick($event, detail)"
+              @mouseenter="detail.chunkId && $emit('citationHover', detail.chunkId)"
+              @mouseleave="$emit('citationHover', null)"
+            >
+              <span class="inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] rounded bg-neon-blue/15 text-neon-blue text-[0.65rem] font-bold shrink-0">
+                {{ detail.number }}
+              </span>
+              <span class="font-mono text-slate-400 group-hover:text-neon-blue transition-colors truncate">
+                {{ detail.file }}
+              </span>
+              <span
+                v-if="detail.relevance !== undefined"
+                :class="['font-mono text-[0.65rem] shrink-0', relevanceColorClass(detail.relevance)]"
+                :title="`该证据与查询的相关性 ${detail.relevance.toFixed(3)}`"
+              >
+                {{ Math.round(detail.relevance * 100) }}%
+              </span>
+            </div>
           </div>
         </div>
 
@@ -209,6 +251,7 @@
 import { ref, computed, watch, nextTick } from 'vue';
 import { Send, Zap, Shield, User, Bot, AlertTriangle, FileText, X } from 'lucide-vue-next';
 import type { Message, CitationDetail } from '@/types';
+import { renderWithCitations, type RenderedPart } from '@/utils/markdown';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -346,6 +389,49 @@ const closeCitationCard = () => {
   activeCitation.value = null;
 };
 
+/** 从末尾来源列表点击，与点击正文角标等效 */
+const handleSourceListClick = (event: MouseEvent, detail: CitationDetail) => {
+  handleCitationClick(event, {
+    type: 'citation',
+    content: String(detail.number ?? ''),
+    chunkId: detail.chunkId,
+    index: detail.number ?? 0,
+    citationContent: detail.content,
+    citationFile: detail.file,
+    citationRelevance: detail.relevance,
+  });
+};
+
+// ─── AI 消息渲染（markdown + 角标） ────────────────────────────────────────────
+
+/** 按编号取 citation 明细 */
+const detailByNumber = (msg: Message, n: number): CitationDetail | undefined =>
+  msg.citationDetails?.find((d, i) => (d.number ?? i + 1) === n);
+
+/**
+ * 渲染 AI 消息：markdown 转 HTML（已净化）并把 [n] 拆成独立片段。
+ *
+ * 流式过程中 content 会不断增长，每次都重新渲染。marked 对这个量级的
+ * 文本足够快，不做缓存以避免流式时显示滞后。
+ */
+const renderAiMessage = (msg: Message): RenderedPart[] => renderWithCitations(msg.content);
+
+const handleNumberClick = (event: MouseEvent, msg: Message, n: number) => {
+  const detail = detailByNumber(msg, n);
+  if (!detail) return;
+  handleSourceListClick(event, detail);
+};
+
+const emitHoverByNumber = (msg: Message, n: number) => {
+  const chunkId = detailByNumber(msg, n)?.chunkId;
+  if (chunkId) emit('citationHover', chunkId);
+};
+
+const titleForNumber = (msg: Message, n: number): string => {
+  const detail = detailByNumber(msg, n);
+  return detail ? `来源：${detail.file}（点击查看原文）` : '';
+};
+
 /**
  * 相关性配色。阈值与后端 config 对齐：
  *   ANSWERABLE_MIN_RELEVANCE = 0.75  足以支撑基于文档的回答
@@ -359,87 +445,6 @@ const relevanceColorClass = (relevance: number): string => {
   return 'text-red-400';
 };
 
-// ─── 消息内容解析 ──────────────────────────────────────────────────────────────
-
-/**
- * 解析消息内容，将引用标记拆分为可点击的 citation 部分。
- *
- * 支持两种后端格式：
- *   [来源: filename.md]  — _stream_with_citations 输出（主路径）
- *   [1] [2] ...         — 备用数字角标格式
- *
- * citationDetails 按引用出现顺序一一对应（后端不去重），
- * 直接携带 content 和 file 信息，无需通过 chunkMap 路径匹配。
- */
-const parseMessageContent = (
-  content: string,
-  citations?: string[],
-  citationDetails?: CitationDetail[],
-  chunkMap?: Record<string, ChunkInfo>
-): ContentPart[] => {
-  const parts: ContentPart[] = [];
-  const regex = /(\[来源:\s*[^\]]+\]|\[\d+\])/g;
-  let lastIndex = 0;
-  let match;
-  let citationCounter = 0;
-
-  while ((match = regex.exec(content)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push({ type: 'text', content: content.substring(lastIndex, match.index) });
-    }
-
-    let chunkId: string | undefined;
-    let index: number;
-    let citationContent: string | undefined;
-    let citationFile: string | undefined;
-    let citationRelevance: number | undefined;
-
-    if (match[0].startsWith('[来源:')) {
-      // 按出现顺序从 citationDetails 取（精准，不去重，与文本标记一一对应）
-      const detail = citationDetails?.[citationCounter];
-      chunkId = detail?.chunkId ?? citations?.[citationCounter];
-      citationContent = detail?.content;
-      citationFile = detail?.file;
-      citationRelevance = detail?.relevance;
-
-      // 降级：chunkId 存在但 content 为空时，从 chunkMap 补充
-      // 注意 chunkMap 没有 relevance，此路径下卡片不显示相关性
-      if (!citationContent && chunkId && chunkMap?.[chunkId]) {
-        citationContent = chunkMap[chunkId].content;
-        citationFile = citationFile || chunkMap[chunkId].sourceName;
-      }
-
-      index = citationCounter + 1;
-      citationCounter++;
-    } else {
-      // [1] 数字角标格式
-      const n = parseInt(match[0].replace(/[\[\]]/g, ''));
-      const detail = citationDetails?.[n - 1];
-      chunkId = detail?.chunkId ?? citations?.[n - 1];
-      citationContent = detail?.content;
-      citationFile = detail?.file;
-      citationRelevance = detail?.relevance;
-      index = n;
-    }
-
-    parts.push({
-      type: 'citation',
-      content: match[0],
-      chunkId,
-      index,
-      citationContent,
-      citationFile,
-      citationRelevance,
-    });
-    lastIndex = match.index + match[0].length;
-  }
-
-  if (lastIndex < content.length) {
-    parts.push({ type: 'text', content: content.substring(lastIndex) });
-  }
-
-  return parts;
-};
 
 // ─── 自动滚动 ──────────────────────────────────────────────────────────────────
 
@@ -471,5 +476,119 @@ const handleSubmit = () => {
 .citation-card-leave-to {
   opacity: 0;
   transform: translateY(-6px) scale(0.97);
+}
+
+/* Markdown 渲染样式。
+   用 :deep() 因为内容由 v-html 插入，不带 scoped 属性选择器。
+   此前 AI 回答用 whitespace-pre-wrap 纯文本渲染，模型输出的
+   ##、-、** 原样显示且缩进错乱。 */
+.markdown-body :deep(p) {
+  margin: 0 0 0.6em;
+}
+.markdown-body :deep(p:last-child) {
+  margin-bottom: 0;
+}
+
+/* 标题：聊天气泡里不需要 h1 的巨大字号，压到接近正文 */
+.markdown-body :deep(h1),
+.markdown-body :deep(h2),
+.markdown-body :deep(h3),
+.markdown-body :deep(h4) {
+  margin: 0.9em 0 0.45em;
+  font-weight: 600;
+  line-height: 1.35;
+  color: #e2e8f0;
+}
+.markdown-body :deep(h1) { font-size: 1.15em; }
+.markdown-body :deep(h2) { font-size: 1.08em; }
+.markdown-body :deep(h3) { font-size: 1em; }
+.markdown-body :deep(h4) { font-size: 0.95em; }
+.markdown-body :deep(h1:first-child),
+.markdown-body :deep(h2:first-child),
+.markdown-body :deep(h3:first-child) {
+  margin-top: 0;
+}
+
+/* 列表：padding-left 给足，否则中文项目符号与文字挤在一起 */
+.markdown-body :deep(ul),
+.markdown-body :deep(ol) {
+  margin: 0.5em 0;
+  padding-left: 1.5em;
+}
+.markdown-body :deep(li) {
+  margin: 0.25em 0;
+}
+.markdown-body :deep(li > ul),
+.markdown-body :deep(li > ol) {
+  margin: 0.25em 0;
+}
+
+.markdown-body :deep(strong) {
+  font-weight: 600;
+  color: #f1f5f9;
+}
+
+.markdown-body :deep(code) {
+  padding: 0.12em 0.4em;
+  border-radius: 0.25rem;
+  background: rgba(6, 182, 212, 0.12);
+  color: #67e8f9;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 0.9em;
+}
+.markdown-body :deep(pre) {
+  margin: 0.6em 0;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  overflow-x: auto;
+}
+.markdown-body :deep(pre code) {
+  padding: 0;
+  background: none;
+  color: #cbd5e1;
+}
+
+.markdown-body :deep(blockquote) {
+  margin: 0.6em 0;
+  padding: 0.1em 0 0.1em 0.8em;
+  border-left: 2px solid rgba(6, 182, 212, 0.4);
+  color: #94a3b8;
+}
+
+/* 表格：模型常用表格作对比，不设边框会完全对不齐 */
+.markdown-body :deep(table) {
+  margin: 0.6em 0;
+  border-collapse: collapse;
+  font-size: 0.92em;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.markdown-body :deep(th),
+.markdown-body :deep(td) {
+  padding: 0.35em 0.7em;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  text-align: left;
+  vertical-align: top;
+}
+.markdown-body :deep(th) {
+  background: rgba(6, 182, 212, 0.08);
+  font-weight: 600;
+  color: #e2e8f0;
+  white-space: nowrap;
+}
+
+.markdown-body :deep(hr) {
+  margin: 0.9em 0;
+  border: none;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.markdown-body :deep(a) {
+  color: #22d3ee;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 </style>

@@ -141,7 +141,9 @@ export function useChat(logs: Ref<LogEntry[]>, onCitationsReceived?: (chunkIds: 
           msgWithCitation.citations = citationsArray.map((c: any) => c.chunk_id || c.doc_id || c);
 
           // 同时保存完整引用信息（content、file 直接来自后端，无需 chunkMap 路径匹配）
-          msgWithCitation.citationDetails = citationsArray.map((c: any): CitationDetail => ({
+          msgWithCitation.citationDetails = citationsArray.map((c: any, i: number): CitationDetail => ({
+            // 后端按 chunk 去重后分配的角标编号，与正文 [n] 对应
+            number: typeof c.number === 'number' ? c.number : i + 1,
             chunkId: c.chunk_id || c.doc_id || '',
             file: c.file || 'unknown',
             category: c.category || '',

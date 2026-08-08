@@ -35,6 +35,12 @@ export interface Message {
 
 /** 后端引用的完整信息（对应 _stream_with_citations 发送的每条 citation） */
 export interface CitationDetail {
+  /**
+   * 角标编号，与正文 [n] 对应。
+   * 后端按 chunk_id 去重：同一 chunk 被引多次共享同一编号，
+   * 因此 citationDetails 里每个编号只出现一条。
+   */
+  number?: number;
   chunkId: string;
   file: string;
   category: string;
