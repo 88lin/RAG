@@ -243,13 +243,31 @@
                min-h-0 是必需的 —— flex 子项默认 min-height:auto，
                不设置会导致内容撑开父容器而非出现滚动条。 -->
           <div class="flex-1 min-h-0 overflow-y-auto p-4">
-            <div class="text-[0.7rem] uppercase tracking-wider text-slate-600 font-mono mb-2">
-              原文片段
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-[0.7rem] uppercase tracking-wider text-slate-600 font-mono">
+                原文片段（完整 chunk）
+              </span>
+              <span v-if="highlightedParts.some(p => p.hit)" class="text-[0.65rem] text-slate-600">
+                <span class="bg-amber-400/25 text-amber-200 px-1 rounded">高亮</span>
+                = 命中提问词
+              </span>
             </div>
-            <!-- 用无衬线字体 + pre-wrap：保留原文换行（表格与列表靠它对齐），
-                 但不用等宽字体 —— 中文等宽字体渲染差且行长参差。
-                 break-words 防止长 URL 撑破卡片宽度。 -->
-            <p class="text-[0.8rem] text-slate-300 leading-relaxed whitespace-pre-wrap break-words">{{ activeCitation.content }}</p>
+            <!-- 完整展示 chunk，不截取"最相关的一段"：
+                 截取会丢掉否定词与例外条件这类改变语义的上下文，
+                 而相关性分数是针对整个 chunk 算的，只展示局部又会造成口径不一致。
+                 用高亮代替截取 —— 用户仍能快速定位该看哪里。
+
+                 pre-wrap 保留原文换行（表格与列表靠它对齐），
+                 但不用等宽字体：中文等宽渲染差且行长参差。 -->
+            <p class="text-[0.8rem] text-slate-300 leading-relaxed whitespace-pre-wrap break-words">
+              <template v-for="(part, i) in highlightedParts" :key="i">
+                <mark
+                  v-if="part.hit"
+                  class="bg-amber-400/25 text-amber-200 rounded px-0.5"
+                >{{ part.text }}</mark>
+                <span v-else>{{ part.text }}</span>
+              </template>
+            </p>
           </div>
 
           <!-- 卡片底部：chunk ID -->
@@ -257,14 +275,15 @@
             <span class="text-xs text-slate-600 font-mono break-all">chunk: {{ activeCitation.chunkId }}</span>
           </div>
 
-          <!-- 三角箭头，方向随卡片展开方向翻转 -->
+          <!-- 三角箭头。卡片脱离角标居中显示时不画箭头 ——
+               指向一个不相邻的位置反而造成误解。 -->
           <div
-            v-if="cardPlacedBelow"
+            v-if="cardPlacement === 'below'"
             class="absolute -top-2 border-8 border-transparent border-b-neon-blue/40"
             :style="{ left: `${arrowLeft}px` }"
           />
           <div
-            v-else
+            v-else-if="cardPlacement === 'above'"
             class="absolute -bottom-2 border-8 border-transparent border-t-neon-blue/40"
             :style="{ left: `${arrowLeft}px` }"
           />
@@ -278,7 +297,13 @@
 import { ref, computed, watch, nextTick } from 'vue';
 import { Send, Zap, Shield, User, Bot, AlertTriangle, FileText, X } from 'lucide-vue-next';
 import type { Message, CitationDetail } from '@/types';
-import { renderMarkdown, citationNumberFromEvent } from '@/utils/markdown';
+import {
+  renderMarkdown,
+  citationNumberFromEvent,
+  extractQueryTerms,
+  highlightTerms,
+  type HighlightPart,
+} from '@/utils/markdown';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -348,16 +373,22 @@ const CARD_OFFSET_Y = 10;
 /** 卡片与视口边缘的最小留白 */
 const VIEWPORT_MARGIN = 12;
 
+/** 卡片期望高度（px）。原文至少要能展示十几行，否则失去查证价值。 */
+const CARD_PREFERRED_HEIGHT = 460;
+/** 卡片最低高度。低于此值原文区只剩一两行，不如不展示。 */
+const CARD_MIN_HEIGHT = 300;
+
 /**
  * 卡片定位。
  *
- * 此前用硬编码的 300px 估算卡片高度来决定放上方还是下方，
- * 内容变多（新增相关性说明区）后卡片超出视口，
- * top 被钉在 8px、底部被裁掉且无法滚动 —— 因为卡片本身没有高度约束，
- * 只有内容区设了 max-h-64。
+ * 两次迭代的教训：
+ *   一版用硬编码 300px 估算高度决定放上/下，内容变多后溢出且无法滚动。
+ *   二版改为"贴着角标、取上下空间较大的一侧"，但高度完全受角标位置
+ *   摆布 —— 角标在页面顶部时上方空间几乎为零，原文区只剩一两行。
  *
- * 改为：不猜高度，直接给卡片设视口相对的 maxHeight，
- * 由卡片自身滚动。上/下方向按可用空间较大的一侧选择。
+ * 现在的策略：先确定卡片需要多高（CARD_PREFERRED_HEIGHT），
+ * 再找能容纳它的位置。贴着角标只是首选，空间不够就脱离角标、
+ * 在视口内垂直居中 —— 可读性优先于"紧贴触发点"这个美观偏好。
  */
 const cardPositionStyle = computed(() => {
   if (!activeCitation.value) return {};
@@ -372,34 +403,54 @@ const cardPositionStyle = computed(() => {
 
   const spaceBelow = window.innerHeight - r.bottom - CARD_OFFSET_Y - VIEWPORT_MARGIN;
   const spaceAbove = r.top - CARD_OFFSET_Y - VIEWPORT_MARGIN;
-  const placeBelow = spaceBelow >= spaceAbove;
+  const viewportHeight = window.innerHeight - VIEWPORT_MARGIN * 2;
+  const wanted = Math.min(CARD_PREFERRED_HEIGHT, viewportHeight);
 
-  // 可用高度取所选方向的空间，并留一个下限避免极端窄屏下卡片过扁
-  const available = Math.max(180, placeBelow ? spaceBelow : spaceAbove);
-
-  if (placeBelow) {
+  // 优先贴着角标：下方能放下就放下方，否则看上方
+  if (spaceBelow >= Math.min(wanted, CARD_MIN_HEIGHT)) {
     return {
       left: `${left}px`,
       top: `${r.bottom + CARD_OFFSET_Y}px`,
-      maxHeight: `${available}px`,
+      maxHeight: `${Math.min(wanted, spaceBelow)}px`,
+    };
+  }
+  if (spaceAbove >= Math.min(wanted, CARD_MIN_HEIGHT)) {
+    // 向上展开用 bottom 定位，卡片增高不会盖住角标
+    return {
+      left: `${left}px`,
+      bottom: `${window.innerHeight - r.top + CARD_OFFSET_Y}px`,
+      maxHeight: `${Math.min(wanted, spaceAbove)}px`,
     };
   }
 
-  // 向上展开时用 bottom 定位，卡片增高不会盖住角标
+  // 两侧都放不下期望高度 —— 脱离角标，在视口内居中。
+  // 此时不画指向箭头（见 cardPlacement），因为卡片已不与角标相邻。
+  const height = Math.min(wanted, viewportHeight);
   return {
     left: `${left}px`,
-    bottom: `${window.innerHeight - r.top + CARD_OFFSET_Y}px`,
-    maxHeight: `${available}px`,
+    top: `${Math.max(VIEWPORT_MARGIN, (window.innerHeight - height) / 2)}px`,
+    maxHeight: `${height}px`,
   };
 });
 
-/** 箭头方向：卡片在下方时箭头朝上，反之朝下 */
-const cardPlacedBelow = computed(() => {
-  if (!activeCitation.value) return true;
+/**
+ * 卡片相对角标的位置：'below' | 'above' | 'detached'。
+ * 与 cardPositionStyle 用同一套判断，箭头据此决定朝向或不显示。
+ */
+const cardPlacement = computed<'below' | 'above' | 'detached'>(() => {
+  if (!activeCitation.value) return 'below';
   const r = activeCitation.value.triggerRect;
   const spaceBelow = window.innerHeight - r.bottom - CARD_OFFSET_Y - VIEWPORT_MARGIN;
   const spaceAbove = r.top - CARD_OFFSET_Y - VIEWPORT_MARGIN;
-  return spaceBelow >= spaceAbove;
+  const viewportHeight = window.innerHeight - VIEWPORT_MARGIN * 2;
+  const threshold = Math.min(
+    Math.min(CARD_PREFERRED_HEIGHT, viewportHeight),
+    CARD_MIN_HEIGHT
+  );
+
+  if (spaceBelow >= threshold) return 'below';
+  if (spaceAbove >= threshold) return 'above';
+  return 'detached';
 });
 
 /** 三角箭头在卡片内的水平偏移 */
@@ -471,6 +522,28 @@ const handleSourceListClick = (event: MouseEvent, detail: CitationDetail) => {
 };
 
 // ─── AI 消息渲染（markdown + 角标） ────────────────────────────────────────────
+
+/**
+ * 触发本次引用的用户提问。
+ *
+ * 取最后一条 user 消息而非新增 prop：卡片总是在最新一轮回答里点开的，
+ * 而 messages 已经在 props 中。多传一个 prop 只会多一处需要同步的状态。
+ */
+const activeQuery = computed(() => {
+  for (let i = props.messages.length - 1; i >= 0; i--) {
+    if (props.messages[i].role === 'user') return props.messages[i].content;
+  }
+  return '';
+});
+
+/** 原文按提问词切分出的高亮片段 */
+const highlightedParts = computed<HighlightPart[]>(() => {
+  if (!activeCitation.value) return [];
+  return highlightTerms(
+    activeCitation.value.content,
+    extractQueryTerms(activeQuery.value)
+  );
+});
 
 /** 按编号取 citation 明细 */
 const detailByNumber = (msg: Message, n: number): CitationDetail | undefined =>
