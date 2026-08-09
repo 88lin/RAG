@@ -108,3 +108,9 @@ frontend-vue/dist-ssr/
 data/eval/raw/
 data/eval/*.jsonl
 docs/eval/runs/*.jsonl
+
+# 本地 SQLite 数据库（生产用 PostgreSQL）
+data/app.db
+data/app.db-journal
+data/app.db-wal
+data/app.db-shm

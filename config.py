@@ -62,6 +62,37 @@ DATA_DIR = PROJECT_ROOT / "data" / "documents"
 DB_DIR = PROJECT_ROOT / "chroma_db"
 
 # ============================================================
+# 关系数据库（可追溯轨迹、会话、评测结果）
+# ============================================================
+# 向量继续留在 ChromaDB，不引入 pgvector：数据量用不到其优势，
+# 而 evidence 表只存 chunk_id 这个字符串指针，不碰向量本身。
+#
+# 默认 SQLite 是为了零运维起步（Windows 本地开发无需 Docker）。
+# 生产/多副本必须换 PostgreSQL —— SQLite 单写者模型下，
+# 并发写会拿不到锁而报 "database is locked"。
+# 两者共用同一套 SQLAlchemy 模型与 Alembic 迁移，只改这一行。
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    f"sqlite+aiosqlite:///{(PROJECT_ROOT / 'data' / 'app.db').as_posix()}",
+)
+
+# ============================================================
+# Redis（缓存、限流、取消信号、摄入进度）
+# ============================================================
+# Redis 不作为事实来源：其中全部内容可丢弃后重建。
+# 因此所有依赖 Redis 的功能都必须有降级路径 ——
+# 限流降级为放行，缓存降级为穿透，锁降级为无锁。
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_ENABLED = get_bool("REDIS_ENABLED", True)
+
+# 缓存 TTL（秒）
+CACHE_TTL_RETRIEVAL = get_int("CACHE_TTL_RETRIEVAL", 3600)
+CACHE_TTL_EMBEDDING = get_int("CACHE_TTL_EMBEDDING", 86400)
+
+# 限流：每 IP 每窗口允许的请求数
+RATE_LIMIT_PER_MINUTE = get_int("RATE_LIMIT_PER_MINUTE", 30)
+
+# ============================================================
 # Embedding 模型配置
 # ============================================================
 # 默认使用中文模型：知识库与查询均为中文，英文模型（all-MiniLM-L6-v2）
