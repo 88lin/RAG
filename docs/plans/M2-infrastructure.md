@@ -126,7 +126,6 @@ ingest_tasks(id uuid pk, filename text, size_bytes int, category text,
 | `emb:{model}:{sha1(text)}` | string(json) | 24h | 查询向量缓存 |
 | `ingest:{task_id}` | hash | 1h | 摄入进度 |
 | `cancel:{trace_id}` | string | 10min | 取消信号，节点边界检查 |
-| `lock:ingest:{filename}` | string | 30s | 同名文件并发摄入互斥 |
 
 **`kb_version` 嵌进 key 而非用它做失效判断**：文档一变就 `INCR`，
 旧 key 因前缀不匹配自然失效，不必遍历删除（`KEYS` 在生产是禁用操作，
@@ -135,32 +134,6 @@ ingest_tasks(id uuid pk, filename text, size_bytes int, category text,
 
 **Redis 不作为事实来源**：全部内容可丢弃后重建。
 限流计数丢了最多放过一个窗口的请求；缓存丢了只是变慢。
-
-## 分布式锁的实现与边界
-
-同名文件并发上传会导致两个 worker 同时写同一批 chunk。用 Redis 锁互斥：
-
-```python
-# 获取：SET key token NX PX 30000
-#   NX  —— 只在不存在时设置，这是互斥的来源
-#   PX  —— 带过期，持有者崩溃后锁能自动释放（否则死锁）
-#   token = uuid4，用于释放时校验归属
-
-# 释放：Lua 脚本保证「比对 token」与「删除」的原子性
-#   if redis.call("get", KEYS[1]) == ARGV[1] then
-#       return redis.call("del", KEYS[1])
-#   end
-#   直接 DEL 是错的：若本进程的锁已过期并被他人获取，
-#   DEL 会删掉别人的锁。
-```
-
-**必须写进文档的局限**：这是单实例 Redis 锁，主从切换时可能出现
-两个持有者（主节点确认了 SET 但未同步到从节点就宕机）。
-Redlock 需要多个独立 Redis 实例，本项目单实例部署，不引入。
-因此该锁只用于**降低重复劳动**，不用于保证唯一性 —— 真正的唯一性
-由 `ingest_tasks` 表的唯一约束和摄入逻辑的幂等（按文件名先删后插）保证。
-
-这个区分很重要：把锁当唯一性保证是分布式系统里最常见的错误之一。
 
 ## 任务清单
 
@@ -196,7 +169,6 @@ Repository 而非在 service 里直接写 SQL：M4 的面板要复用同一套�
 ### T4 · Redis 客户端与限流迁移（2h）
 
 - `backend/cache/redis_client.py` —— 连接池 + 健康检查
-- `backend/cache/lock.py` —— `SET NX PX` + Lua 释放
 - `rate_limit.py` 改用 Redis `INCR`，**Redis 不可用时降级为放行**
   （限流是保护措施，不该因它挂掉而拒绝全部流量）
 - 检索缓存接入 `kb_version`
@@ -227,14 +199,18 @@ Repository 而非在 service 里直接写 SQL：M4 的面板要复用同一套�
 | C7 | Redis 停掉后请求仍能成功（降级放行） | 停容器实测 |
 | C8 | 上传 5MB PDF 立即返回 task_id，不阻塞 | 计时实测 |
 | C9 | 文档变更后 `kb_version` 自增，旧检索缓存不再命中 | `redis-cli GET kb_version` |
-| C10 | 分布式锁单测：并发获取只有一个成功；过期后可再获取；释放时不误删他人锁 | pytest |
-| C11 | 全部测试通过，前端 `vue-tsc` 通过 | 命令输出 |
+| C10 | 全部测试通过，前端 `vue-tsc` 通过 | 命令输出 |
 
 ## 明确不做
 
 - 不引入 pgvector（向量留在 ChromaDB）
 - 不引入 Celery（`asyncio.Queue` 够用）
-- 不做 Redlock（单实例部署，且锁不承担唯一性保证）
+- **不做分布式锁**。曾实现过一版后移除：摄入逻辑本身幂等
+  （`ingest_text` 与流式路径都先 `delete_by_file` 再插入），
+  并发重复摄入不会破坏数据，最坏只是白算一次 embedding。
+  锁在这里只是性能优化而非正确性需求，为此引入一套需要理解
+  `SET NX PX` + Lua 释放 + 主从切换边界的机制不划算。
+  真需要唯一性时正确做法是数据库唯一约束。
 - 不做用户系统与鉴权（M5 视情况）
 - 不做 Agent 编排（M3）
 - 不改前端（M4 统一改）
@@ -244,7 +220,8 @@ Repository 而非在 service 里直接写 SQL：M4 的面板要复用同一套�
 - **Docker 起不来 PG** → 退回 SQLite（`aiosqlite`），
   同一套 SQLAlchemy 模型与 Alembic 迁移，只改 `DATABASE_URL`。
   在 README 注明"当前用 SQLite，多副本需换 PG"。
-- **Redis 不可用** → 限流降级放行、缓存直接穿透、锁退化为无锁
-  （摄入的幂等由"按文件名先删后插"保证）。这条是设计要求，不是回退。
+- **Redis 不可用** → 限流降级放行、缓存直接穿透。
+  这条是设计要求，不是回退：把 Redis 当强依赖，
+  系统可用性上限就等于 Redis 的可用性。
 - **异步摄入导致进度事件丢失** → 保留现有同步 SSE 上传端点作为兜底，
   两个端点并存一个版本周期。

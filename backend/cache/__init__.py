@@ -1,9 +1,9 @@
-"""缓存与协调层：Redis 客户端、分布式锁。
+"""缓存层：Redis 客户端。
 
-全部功能在 Redis 不可用时降级运行 —— Redis 不是事实来源。
+全部功能在 Redis 不可用时降级运行 —— Redis 不是事实来源，
+其中内容可丢弃后重建。
 """
 
-from .lock import RedisLock, guard
 from .redis_client import (
     KB_VERSION_KEY,
     bump_kb_version,
@@ -21,8 +21,6 @@ from .redis_client import (
 )
 
 __all__ = [
-    "RedisLock",
-    "guard",
     "KB_VERSION_KEY",
     "bump_kb_version",
     "close",
