@@ -24,7 +24,7 @@
 |---|---|---|---|---|
 | M0 | 地基修正：分数口径、中文模型、RRF、chunk 定位 | 6-8h | **完成** | [M0](plans/M0-foundation.md) |
 | M1 | 评测集与检索实验 | 14-18h | **完成** | [M1](plans/M1-evaluation.md) |
-| M2 | 基础设施：PG + Redis + 异步摄入 | 8-10h | **进行中** | 待写 |
+| M2 | 基础设施：PG + Redis + 异步摄入 | 8-10h | **进行中** | [M2](plans/M2-infrastructure.md) |
 | M3 | Agentic 编排：路由、工具、引用校验 | 18-22h | 未开始 | 待写 |
 | M4 | 大脑面板改造：轨迹、证据、校验视图 | 8-10h | 未开始 | 待写 |
 | M5 | 测试、Docker、README、安全 | 8-10h | 未开始 | 待写 |
@@ -125,9 +125,23 @@ route → direct_rag / clarify / agent
 | `calculate` | **绝不用 eval**。`ast.parse` + 节点白名单 |
 | `web_search` | 默认关闭需授权。SSRF 防护：仅 https、拒私网 IP、禁跨主机重定向、响应限 512KB |
 
-横切关注点放在 dispatcher 做一次，不散进每个工具：超时、幂等键、
-重试、取消检查、落库、SSE 推送。幂等键 = `sha1(tool + canonical_json(args) + kb_version)`，
-同时是防 Agent 死循环刷同一工具的兜底。
+横切关注点放在 dispatcher 做一次，不散进每个工具：超时、幂等、
+重试、取消检查、落库、SSE 推送。
+
+**幂等分两个键，不共用一个字段**（见 [ADR-003](decisions/ADR-003-tool-call-idempotency-key.md)）：
+
+- `idempotency_key = sha1(run_id + seq + tool + canonical_json(args))`
+  —— run 内防重放，**带 UNIQUE 约束**，先插占位行再执行（并发下靠
+  约束冲突判重，不靠"先查再写"，后者两个请求会同时查到空）
+- `ret:{tool}:{sha1(args)}:{kb_version}` —— 跨 run 结果缓存，放 Redis 带 TTL，
+  **只对声明 `side_effects=False` 的只读工具启用**
+
+原先定的全局键 `sha1(tool + args + kb_version)` 已废弃：它不含 run_id，
+会把"两次都该生效的相同请求"判成重复。本项目四个工具恰好都只读，
+所以这个错误暂时看不出后果 —— 但形状错了就该改。
+
+防 Agent 死循环**不用幂等键做**，用每 run 的工具调用次数上限 +
+同一 `(tool, args)` 在本 run 内的重复次数上限。那是控制流问题。
 
 **citation_verify 是简历上最能打的一环**：答案按标点切句，
 每个带 `[doc_X]` 的句子用 cross-encoder 算 (句子, 被引 chunk) 的支持度，
@@ -183,6 +197,7 @@ SSE 断线恢复：客户端带 `Last-Event-ID`，服务端从 Redis Stream 补�
 | 关系库 | PostgreSQL | 轨迹要能按 trace_id 查询与聚合，内存态站不住 |
 | 缓存 | Redis，不作为事实来源 | 只放缓存/限流/取消信号/事件流 |
 | 检索融合 | RRF，无权重参数 | 两路分数量纲不同，加权相加无物理意义。见 [ADR-001](decisions/ADR-001-rrf-over-weighted-fusion.md) |
+| 工具幂等 | 拆成 run 内步骤键 + 跨 run 缓存键 | 一个字段塞两种语义会让全局键把合法的重复请求判成重复。唯一性交给数据库约束而非应用层"先查再写"。见 [ADR-003](decisions/ADR-003-tool-call-idempotency-key.md) |
 | 评测数据 | T2Ranking + CRUD-RAG，不自己标注 | 规模、避免循环论证、可比性。见 [ADR-002](decisions/ADR-002-eval-dataset-choice.md) |
 | 指标实现 | 检索层自研，生成层用 Ragas | 确定性运算应可单测；语义判断才交给 LLM，且必须人工抽检报一致率 |
 

@@ -86,7 +86,7 @@ run_steps(id bigserial pk, run_id fk, seq int, node text,
 
 tool_calls(id bigserial pk, run_id fk, seq int, tool text,
            args jsonb, result_summary text, ms int, ok bool,
-           idempotency_key text,               -- sha1(tool+args+kb_version)
+           idempotency_key text,               -- M3 才写入，见 ADR-003
            unique(run_id, seq))
 
 evidence(id bigserial pk, run_id fk, chunk_id text, file text,
@@ -152,6 +152,19 @@ ingest_tasks(id uuid pk, filename text, size_bytes int, category text,
   FastAPI 依赖注入提供 session
 - Alembic 初始化 + 首个迁移
 - **不引入 pgvector**（ROADMAP 已定）
+
+实施中发现并修掉的两处（原计划没预见）：
+
+- **`BigInteger` 主键在 SQLite 上不自增**。SQLite 的隐式自增要求列类型名
+  恰好是 `"INTEGER"`，`BIGINT` 有整数亲和性但不是 rowid 别名，插入直接报
+  `NOT NULL constraint failed`。而 SQLite 正是默认配置与失败回退路径 ——
+  等于 DB 层在默认配置下一行都写不进去。改用
+  `BigInteger().with_variant(Integer, "sqlite")`。
+- **`DateTime(timezone=True)` 在 SQLite 上不保留时区**。它没有原生时间类型，
+  读回来一律 naive，于是 `created_at > utcnow()` 在 PG 上正常、
+  在 SQLite 上抛 `can't compare offset-naive and offset-aware`。
+  加 `UtcDateTime(TypeDecorator)` 在类型层抹平，手法同 `JSONField`
+  抹平 JSONB/JSON。
 
 ### T3 · Repository 层（2h）
 
