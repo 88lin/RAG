@@ -8,6 +8,10 @@ from config import (
     PROJECT_ROOT, DATA_DIR, DB_DIR,
     CHROMA_DB_PATH, COLLECTION_NAME,
     TOP_K_RESULTS,
+    # M2：关系库与缓存。透传而非在此处重新读 os.getenv ——
+    # config.py 是配置的唯一入口（CLAUDE.md 架构约束）
+    DATABASE_URL, REDIS_URL, REDIS_ENABLED,
+    RATE_LIMIT_PER_MINUTE,
 )
 
 # ==================== 服务器配置 ====================
