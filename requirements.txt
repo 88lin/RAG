@@ -11,6 +11,20 @@ python-dotenv==1.0.1
 python-multipart==0.0.6
 psutil==5.9.8
 
+# ==================== 关系数据库与缓存（M2）====================
+# 版本与 venv 实测一致。这几个此前只装在本地环境而没写进本文件，
+# 结果是 Docker 构建与新克隆的机器起不来 —— 依赖必须声明才算存在。
+sqlalchemy[asyncio]==2.0.36
+alembic==1.14.0
+# asyncpg 走生产（PostgreSQL），aiosqlite 走本地零运维起步。
+# 两者共用同一套模型与迁移，只改 DATABASE_URL 一行。
+asyncpg==0.30.0
+aiosqlite==0.20.0
+# SQLAlchemy 的 asyncio 支持依赖 greenlet 做同步/异步桥接。
+# pip 会随 sqlalchemy[asyncio] 带上它，显式钉版本是为了让构建可复现。
+greenlet==3.1.1
+redis==5.2.1
+
 # ==================== RAG 核心依赖 ====================
 # Vector Database
 chromadb==0.4.22
