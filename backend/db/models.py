@@ -65,6 +65,49 @@ class JSONField(TypeDecorator):
         return dialect.type_descriptor(JSON())
 
 
+# 自增主键的类型。**不能直接用 BigInteger**：
+# SQLite 的隐式自增要求列类型名恰好是 "INTEGER"，而 BigInteger 渲染成
+# "BIGINT" —— 它仍有整数亲和性，但不是 rowid 别名，于是插入时主键拿不到
+# 自增值，直接报 "NOT NULL constraint failed"。
+# PG 上必须是 BIGINT：轨迹表按每次问答若干行的速度增长，
+# INTEGER 的 21 亿上限不是安全余量。
+# 因此按方言取变体，而不是二选一。
+PrimaryKeyInt = BigInteger().with_variant(Integer, "sqlite")
+
+
+class UtcDateTime(TypeDecorator):
+    """始终返回带时区（UTC）的 datetime。
+
+    **`DateTime(timezone=True)` 不足以保证这件事。** PG 的 TIMESTAMPTZ 本来
+    就返回 aware datetime，但 SQLite 没有原生时间类型 —— 存的是字符串，
+    读回来一律 naive，`timezone=True` 在它上面只是个被忽略的提示。
+
+    结果是同一份代码在两个库上拿到不同类型的对象：
+    `run.created_at > utcnow()` 在 PG 上正常，在 SQLite 上抛
+    "can't compare offset-naive and offset-aware datetimes"。
+    这类差异必须在类型层抹平，否则每个调用点都要自己判一次。
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: Optional[datetime], dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            # naive 一律按 UTC 解释，不猜本地时区：
+            # 猜错会写进偏移几小时的时间戳，而这种错误在数据里看不出来
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def process_result_value(self, value: Optional[datetime], dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -80,11 +123,11 @@ class Session(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
     # 用于清理过期会话，每次交互更新
     last_active_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+        UtcDateTime, default=utcnow, nullable=False, index=True
     )
     meta: Mapped[Dict[str, Any]] = mapped_column(JSONField, default=dict, nullable=False)
 
@@ -102,14 +145,14 @@ class Message(Base):
         Index("ix_messages_session_created", "session_id", "created_at"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(
         ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
     )
     role: Mapped[str] = mapped_column(String(16), nullable=False)  # user / assistant
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
     run_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
@@ -139,7 +182,7 @@ class Run(Base):
         Index("ix_runs_created_desc", "created_at"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     trace_id: Mapped[str] = mapped_column(
         String(36), unique=True, nullable=False, index=True,
         default=lambda: str(uuid.uuid4()),
@@ -162,10 +205,10 @@ class Run(Base):
 
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
     finished_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        UtcDateTime, nullable=True
     )
 
     steps: Mapped[List["RunStep"]] = relationship(
@@ -191,7 +234,7 @@ class RunStep(Base):
         UniqueConstraint("run_id", "seq", name="uq_run_steps_run_seq"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(
         ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -202,7 +245,7 @@ class RunStep(Base):
         JSONField, default=dict, nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
 
     run: Mapped["Run"] = relationship(back_populates="steps")
@@ -224,7 +267,7 @@ class ToolCall(Base):
         Index("ix_tool_calls_tool_ok", "tool", "ok"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(
         ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -238,7 +281,7 @@ class ToolCall(Base):
     ok: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
 
     run: Mapped["Run"] = relationship(back_populates="tool_calls")
@@ -256,7 +299,7 @@ class Evidence(Base):
         Index("ix_evidence_chunk", "chunk_id"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(
         ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -287,7 +330,7 @@ class Citation(Base):
         Index("ix_citations_message", "message_id", "sentence_idx"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     message_id: Mapped[int] = mapped_column(
         ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
     )
@@ -308,14 +351,14 @@ class Feedback(Base):
 
     __tablename__ = "feedback"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     message_id: Mapped[int] = mapped_column(
         ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
     )
     rating: Mapped[int] = mapped_column(SmallInteger, nullable=False)  # -1 / 0 / 1
     comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
 
 
@@ -324,14 +367,14 @@ class EvalRun(Base):
 
     __tablename__ = "eval_runs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     suite: Mapped[str] = mapped_column(String(64), nullable=False)   # t2ranking / faithfulness
     variant: Mapped[str] = mapped_column(String(64), nullable=False)  # rrf / vector_bge ...
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
     finished_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        UtcDateTime, nullable=True
     )
     meta: Mapped[Dict[str, Any]] = mapped_column(JSONField, default=dict, nullable=False)
 
@@ -349,7 +392,7 @@ class EvalResult(Base):
         Index("ix_eval_results_run_qid", "eval_run_id", "qid"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PrimaryKeyInt, primary_key=True, autoincrement=True)
     eval_run_id: Mapped[int] = mapped_column(
         ForeignKey("eval_runs.id", ondelete="CASCADE"), nullable=False
     )
@@ -386,8 +429,8 @@ class IngestTask(Base):
     chunk_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
     finished_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        UtcDateTime, nullable=True
     )
