@@ -149,7 +149,32 @@ techcorp_docs                               21   换指纹前旧库，可删
 - `create_all` 与 Alembic 并存的漂移风险。已在 `alembic/README.md` 写明：
   `init_models()` 只用于测试，生产路径只有 `alembic upgrade head`。
   lifespan 里**没有**调 `create_all`。
-- `rate_limit.py` 仍是内存态（T4 后半）。重启后限流归零，多副本配额翻倍。
+- `rate_limit.py` 三个缺陷，**其中两个单机就存在**，T4 的范围应当覆盖：
+  1. 内存态 → 重启归零、多副本配额翻 N 倍（原计划已知）
+  2. **`request_history` 无界增长**。`defaultdict(deque)` 为每个见过的 IP
+     建一个 deque 且**永不清理** —— 只有该 IP 再次访问才会清掉它自己的
+     过期条目。被换 IP 扫描就会持续吃内存。
+  3. **`x-forwarded-for` 无条件信任**（`rate_limit.py:35-39`）。攻击者
+     每个请求伪造一个不同的 XFF 即可完全绕过限流，同时放大第 2 条。
+     修法是只在可信代理后才采信该头（配置可信代理列表或跳数）。
+- **`asyncio.sleep(0)` 不能让阻塞调用变成非阻塞**。
+  `streaming_ingestion.py:106,137,177,203` 的注释写"让出控制权，避免阻塞
+  事件循环"，但 `sleep(0)` 只在调用**之前**让出一次；紧随其后的
+  `embedder.encode_documents(batch)` 是同步 CPU 计算，仍然把事件循环
+  阻塞整个批次的时长。分批确实把单次阻塞时长限制在一批内（有缓解作用），
+  但期间所有其它请求（含别人的 SSE 流与 `/health`）都在等。
+  正解是 `await asyncio.to_thread(...encode_documents, batch)`。属 T6 范围。
+- **`upload.py:105` 的同步端点完全没有 offload**。`ingestion.ingest_file()`
+  直接在 `async def` 里跑，10MB 文件的 embedding 期间整个进程停摆。
+  T6 改异步摄入时这个端点会被替换，但在那之前它是最大的单点阻塞。
+- **`routes.py` 的 ChromaDB 调用直接在 `async def` 里**（`VectorDB()`、
+  `collection.get/delete/count`）。其中 `list_documents(include_chunks=True)`
+  会拉全库文档内容，是同步阻塞调用。数据量小时无感，语料涨上去会明显。
+- **`_sync_generator_to_async` 每个流式请求占用两份线程资源**
+  （`chat_service.py:22-51`）：一个专属 `threading.Thread` 跑生产者，
+  外加 `asyncio.to_thread(queue.get)` **阻塞占用默认线程池的一个 worker**
+  等待数据。默认池只有 `min(32, cpu+4)` 个 worker，并发流式请求多了会
+  把池占满，而 `to_thread` 的其它用途（检索、指代消解）也共用这个池。
 - `Index("ix_runs_created_desc", "created_at")` 实际是升序索引，名字里的
   desc 名不副实。单列索引可反向扫描，功能上没问题，仅命名误导。
 - `scripts/` 下 4 个历史调试脚本仍引用已删配置
