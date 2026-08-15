@@ -1,4 +1,59 @@
 services:
+  # ==================== PostgreSQL ====================
+  # 存关系数据与可追溯轨迹（runs / run_steps / tool_calls / evidence）。
+  # 向量继续留在 ChromaDB，不引入 pgvector（见 docs/ROADMAP.md 已定决策）。
+  postgres:
+    image: postgres:16-alpine
+    container_name: deepblue-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+      POSTGRES_USER: ${POSTGRES_USER:-raguser}
+      # 没有默认密码：留空会让 postgres 镜像直接拒绝启动，
+      # 这比静默用一个人人皆知的弱密码起来要好
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须在 .env 中设置}
+      # 让容器内的时间戳与应用一致，避免排查轨迹时对不上表
+      TZ: UTC
+    volumes:
+      # 命名卷而非 bind mount：PG 的数据目录对权限敏感，
+      # 挂宿主机目录在 Windows 上会因权限问题起不来
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready 只探测"能否接受连接"，不建连接不查表，代价极低。
+      # 带 -U/-d 是必须的：不带会用容器内默认用户名探测而误报失败
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-raguser} -d ${POSTGRES_DB:-ragdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # 首次启动要初始化数据目录，给足时间再开始计 retries
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+  # ==================== Redis ====================
+  # 只放缓存 / 限流 / 取消信号 / 事件流。**不是事实来源** ——
+  # 全部内容可丢弃后重建，因此没有持久化卷也不影响正确性。
+  redis:
+    image: redis:7-alpine
+    container_name: deepblue-redis
+    # maxmemory + allkeys-lru：Redis 默认 noeviction 策略下内存打满会开始
+    # 拒绝写入，那时缓存层会从"变慢"退化为"报错"。缓存应该被淘汰而不是报错。
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - rag-network
+
   # ==================== 后端服务 ====================
   backend:
     build:
@@ -12,6 +67,17 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
+      # 这两行覆盖 .env 里的本机地址。compose 中 environment 优先于 env_file，
+      # 因此开发机上 .env 可以继续指向 localhost，容器内自动切到服务名。
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ragdb}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      # service_healthy 而非 service_started：PG 容器起来到能接受连接之间
+      # 有十几秒，此时 backend 连库会失败并退出
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       # 持久化数据（bind mount，数据保存在宿主机目录）
       - ./chroma_db:/app/chroma_db
@@ -49,3 +115,8 @@ services:
 networks:
   rag-network:
     driver: bridge
+
+volumes:
+  # 只有 PG 需要持久化：它是事实来源。
+  # Redis 故意不挂卷 —— 挂了会让人误以为里面的数据不能丢。
+  postgres_data:
