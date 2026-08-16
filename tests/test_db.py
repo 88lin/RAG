@@ -455,6 +455,83 @@ class TestEngineLifecycle:
         await db.init_models()
 
 
+class TestSqlitePragmas:
+    """`_apply_sqlite_pragmas` 修正的三个默认行为。
+
+    这些是连接级设置，删掉监听器不会有任何语法错误，只会让行为悄悄
+    退回 SQLite 的默认值 —— 而默认值与 PostgreSQL 不一致。
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_keys_are_enforced(self, db):
+        """指向不存在父行的外键必须被拒绝。
+
+        SQLite 默认**不强制**外键，`ondelete="CASCADE"` 只是装饰。
+        没有 `PRAGMA foreign_keys=ON` 时这条插入会成功，
+        留下一条指向空气的消息。
+        """
+        with pytest.raises(IntegrityError):
+            async with db.session_scope() as s:
+                s.add(Message(session_id="根本不存在", role="user", content="x"))
+
+    @pytest.mark.asyncio
+    async def test_database_level_cascade_works(self, db):
+        """批量 DELETE 时靠数据库外键级联，不靠 ORM。
+
+        与 test_deleting_session_removes_messages 的区别很重要：
+        那条用 `session.delete(obj)`，走的是 SQLAlchemy 在 Python 里
+        逐个删的 ORM 级联 —— **即使数据库根本不强制外键它也会通过**。
+        这条用 DELETE 语句，只有数据库真的级联才成立。
+        """
+        from sqlalchemy import delete
+
+        async with db.session_scope() as s:
+            s.add(Session(id="s1"))
+            await s.flush()
+            s.add(Message(session_id="s1", role="user", content="x"))
+
+        async with db.session_scope() as s:
+            await s.execute(delete(Session).where(Session.id == "s1"))
+
+        async with db.session_scope() as s:
+            count = (await s.execute(
+                select(func.count()).select_from(Message)
+            )).scalar_one()
+            assert count == 0, "数据库级联没生效，外键约束可能没打开"
+
+    @pytest.mark.asyncio
+    async def test_savepoint_rolls_back_independently(self, db):
+        """内层 SAVEPOINT 回滚不影响外层事务。
+
+        pysqlite 的隐式事务管理会破坏这个语义 —— 不关掉它的话，
+        内层回滚后数据仍在，`get_or_create` 的并发处理就是错的。
+        """
+        async with db.session_scope() as s:
+            s.add(Run(query="外层保留", trace_id="outer"))
+            await s.flush()
+
+            try:
+                async with s.begin_nested():
+                    s.add(Run(query="内层丢弃", trace_id="outer"))  # 撞唯一约束
+            except IntegrityError:
+                pass
+
+            s.add(Run(query="内层之后", trace_id="after"))
+
+        async with db.session_scope() as s:
+            traces = (await s.execute(select(Run.trace_id))).scalars().all()
+            assert sorted(traces) == ["after", "outer"]
+
+    @pytest.mark.asyncio
+    async def test_wal_mode_enabled(self, db):
+        """WAL 模式：读不阻塞写。默认的 rollback journal 下两者互斥。"""
+        from sqlalchemy import text
+
+        async with db.session_scope() as s:
+            mode = (await s.execute(text("PRAGMA journal_mode"))).scalar_one()
+            assert mode.lower() == "wal"
+
+
 class TestHealthcheck:
     @pytest.mark.asyncio
     async def test_healthcheck_ok(self, db):

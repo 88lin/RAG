@@ -4,8 +4,8 @@
 
 ## 当前位置
 
-**阶段**：M2 基础设施 —— **进行中**（T1、T2 完成）
-**下一步**：T3 Repository 层
+**阶段**：M2 基础设施 —— **进行中**（T1、T2、T3 完成）
+**下一步**：T4 Redis 与限流迁移（范围已扩写），或 T5 会话落库
 **计划书**：`docs/plans/M2-infrastructure.md`
 
 ## M2 任务状态
@@ -14,10 +14,26 @@
 |---|---|---|
 | T1 依赖与容器 | **完成** | compose 加 PG16 + Redis7 含健康检查；requirements 补 6 个依赖；`.env.example` 同步 |
 | T2 ORM 与迁移 | **完成** | 11 张表 + Alembic 初始化 + 首个迁移；修掉 SQLite 主键与时区两处缺陷 |
-| T3 Repository 层 | 未开始 | —— |
-| T4 Redis + 限流迁移 | 一半 | `redis_client.py` 已有并有测试；`rate_limit.py` 仍是 `defaultdict(deque)` 内存态 |
-| T5 会话落库 | 未开始 | —— |
-| T6 异步摄入 | 未开始 | —— |
+| T3 Repository 层 | **完成** | 4 个 Repository + 54 条测试；修掉 SQLite 外键不强制、SAVEPOINT 失效、并发写死锁三处 |
+| T4 Redis + 限流迁移 | 一半 | `redis_client.py` 已有并有测试；`rate_limit.py` 仍是内存态。**范围已扩写**（XFF 信任、无界增长、缓存三大问题防御） |
+| T5 会话落库 | 未开始 | Repository 已就绪，剩下改 `chat_service.py` |
+| T6 异步摄入 | 未开始 | `IngestTaskRepository` 已就绪；摄入路径的阻塞调用已修 |
+
+## Repository 层的三条硬约束
+
+写在 `backend/repositories/base.py`，`tests/test_repositories.py::TestNoCommit`
+用行为测试 + 源码扫描双重守着：
+
+1. **不 commit**。session 由调用方传入，事务边界归 service。
+   任何方法自己提交，跨表原子性就没了。
+2. **需要自增 id 时 flush 而非 commit**。
+3. **查集合关系必须显式预加载**。async 下懒加载抛 `MissingGreenlet` /
+   `DetachedInstanceError`，这不是性能优化是能不能跑。
+   `get_by_trace` 用 `selectinload` 而非 `joinedload` —— 后者对三个
+   集合会产生笛卡尔积。`list_recent` **故意不预加载**，列表页只要标量字段。
+
+按**聚合**而非按表划分：`RunRepository` 同时管 runs / run_steps /
+tool_calls，因为后两者不能脱离 run 存在。
 
 ## 验收标准进度
 
@@ -28,28 +44,34 @@
 | C3-C5 | runs/evidence 落库、重启后数据仍在 | 未开始（依赖 T3） |
 | C6-C7 | 限流存 Redis、Redis 停掉仍放行 | 未开始（T4 后半） |
 | C8-C9 | 异步上传、`kb_version` 自增 | 未开始（T6） |
-| C10 | 测试通过 + 前端 `vue-tsc` 通过 | **通过** —— 170 passed；`vue-tsc --noEmit` exit 0 |
+| C10 | 测试通过 + 前端 `vue-tsc` 通过 | **通过** —— 228 passed；`vue-tsc --noEmit` exit 0 |
 
 ## 测试覆盖
 
 ```
-tests/test_scoring.py         分数口径
-tests/test_metrics.py         检索指标
-tests/test_threshold.py       阈值校准
-tests/test_db.py         32 条  ORM/约束/级联/事务边界/并发
+tests/test_scoring.py      37 条  分数口径
+tests/test_metrics.py      35 条  检索指标
+tests/test_threshold.py    17 条  阈值校准
+tests/test_db.py           36 条  ORM/约束/级联/事务边界/并发/SQLite PRAGMA
 tests/test_redis_client.py 41 条  降级路径（三种不可用形态）
-tests/test_migrations.py   8 条  迁移与模型不漂移、升降级往返
-                          ---
-                          170 passed
+tests/test_migrations.py    8 条  迁移与模型不漂移、升降级往返
+tests/test_repositories.py 54 条  四个 Repository + 三条硬约束
+                          ----
+                          228 passed（约 17s）
 ```
 
-DB 层与 Redis 客户端此前是零覆盖，b67a4c2 写的代码从未被执行过。
-补测试当场查出两个使 DB 层在默认配置下完全不可用的缺陷（见下）。
+仍然零覆盖：`api/`、`services/chat_service.py`、`adapters/`、
+`rate_limit.py`、`rag/retriever.py`、`rag/llm.py`。集成测试属 M5，
+需要 fake LLM provider 才能不烧 token。
 
 ## M2 已修掉的缺陷
 
-两处都只在 SQLite 上出现，而 SQLite 是默认 `DATABASE_URL` 与计划书写明的
-失败回退路径 —— 也就是说不是边缘情况：
+**五处，全部只在 SQLite 上出现**，而 SQLite 是默认 `DATABASE_URL` 与计划书
+写明的失败回退路径 —— 不是边缘情况。共同点是"开发环境静默通过、换库或
+上线才暴露"，**五处全部是补测试时才查出的**，此前 DB 层零覆盖，
+b67a4c2 写的代码从未被执行过。
+
+T2 期间（`models.py`）：
 
 1. **`BigInteger` 主键不自增**。SQLite 的隐式自增要求列类型名恰好是
    `"INTEGER"`；`BIGINT` 有整数亲和性但不是 rowid 别名，插入报
@@ -59,6 +81,23 @@ DB 层与 Redis 客户端此前是零覆盖，b67a4c2 写的代码从未被执�
    读回来一律 naive，`created_at > utcnow()` 在 PG 上正常、在 SQLite 上抛
    `can't compare offset-naive and offset-aware`。加 `UtcDateTime`
    TypeDecorator 在类型层抹平。
+
+T3 期间（`session.py::_apply_sqlite_pragmas`）：
+
+3. **SQLite 默认不强制外键**。`ondelete="CASCADE"` 写了也白写。
+   需每连接 `PRAGMA foreign_keys=ON`。
+   **此前的级联测试是因为错误的原因通过的** —— 它用 `session.delete(obj)`，
+   走的是 SQLAlchemy 在 Python 里逐个删的 ORM 级联，即使数据库根本不强制
+   外键也会通过。现已补 `TestSqlitePragmas::test_database_level_cascade_works`
+   用 DELETE 语句验数据库级联。
+4. **pysqlite 的隐式事务管理破坏 SAVEPOINT**。`begin_nested()` 的保存点
+   无法正确回滚，`SessionRepository.get_or_create` 的并发处理会失效。
+   修法是 SQLAlchemy 文档的标准方案：`isolation_level = None` +
+   自己发 BEGIN。
+5. **并发写死锁**。修完 4 之后并发写撞 `database is locked`。
+   默认的 deferred 事务延迟申请写锁，两个事务各持读锁再同时升级即死锁，
+   **`busy_timeout` 对此无效**（那是死锁不是繁忙）。需
+   `journal_mode=WAL` + `busy_timeout` + **`BEGIN IMMEDIATE`**，三者缺一不可。
 
 ## 环境坑（本轮新踩）
 
@@ -144,8 +183,8 @@ techcorp_docs                               21   换指纹前旧库，可删
 
 ## 待办观察（边界外）
 
-- **`.env` 缺 `POSTGRES_PASSWORD`**，`docker compose up` 会直接报错退出。
-  这是故意的（没有默认弱密码），但动手起容器前要先补这一行。
+- `.env` 已补 `POSTGRES_DB/USER/PASSWORD`（compose 用 `${VAR:?}` 强制必填，
+  不给默认弱密码）。`DATABASE_URL` 默认注释掉走 SQLite，要连 PG 就取消注释。
 - `create_all` 与 Alembic 并存的漂移风险。已在 `alembic/README.md` 写明：
   `init_models()` 只用于测试，生产路径只有 `alembic upgrade head`。
   lifespan 里**没有**调 `create_all`。
@@ -157,13 +196,10 @@ techcorp_docs                               21   换指纹前旧库，可删
   3. **`x-forwarded-for` 无条件信任**（`rate_limit.py:35-39`）。攻击者
      每个请求伪造一个不同的 XFF 即可完全绕过限流，同时放大第 2 条。
      修法是只在可信代理后才采信该头（配置可信代理列表或跳数）。
-- **`asyncio.sleep(0)` 不能让阻塞调用变成非阻塞**。
-  `streaming_ingestion.py:106,137,177,203` 的注释写"让出控制权，避免阻塞
-  事件循环"，但 `sleep(0)` 只在调用**之前**让出一次；紧随其后的
-  `embedder.encode_documents(batch)` 是同步 CPU 计算，仍然把事件循环
-  阻塞整个批次的时长。分批确实把单次阻塞时长限制在一批内（有缓解作用），
-  但期间所有其它请求（含别人的 SSE 流与 `/health`）都在等。
-  正解是 `await asyncio.to_thread(...encode_documents, batch)`。属 T6 范围。
+- ~~`streaming_ingestion.py` 的 `asyncio.sleep(0)`~~ **已修**（08ec861）。
+  记住这条结论：**`sleep(0)` 不能让阻塞调用变成非阻塞** —— 它只在调用
+  之前让出一次控制权，紧随其后的同步计算照样霸占事件循环。
+  六处改成了 `asyncio.to_thread`。
 - **`upload.py:105` 的同步端点完全没有 offload**。`ingestion.ingest_file()`
   直接在 `async def` 里跑，10MB 文件的 embedding 期间整个进程停摆。
   T6 改异步摄入时这个端点会被替换，但在那之前它是最大的单点阻塞。
