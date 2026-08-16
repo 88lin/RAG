@@ -145,22 +145,43 @@ should_use_context = top_relevance >= ANSWERABLE_MIN_RELEVANCE
 **原则：每一步都随该阶段本来就要做的工作一起做，不单独开重构分支。**
 纯搬家的 PR 收益低、冲突多，而且搬完还是那段已知不可行的单阈值逻辑。
 
-### 阶段 1 · 随 M3 的 answerability 重做（M3 内）
+### 阶段 1 · 删掉重复实现（M2 的 T0b，不必等 M3）
 
-新建 `rag/answerability.py`，把 `chat_service.py:304-329` 的判断逻辑搬进去
-并按 M1 的结论重做：
+**本节初版写错了，已更正。** 初版说"新建 `rag/answerability.py`，把
+`chat_service.py:304-329` 搬进去"，前提是这条规则只存在于 service 层
+（位置漂移）。实测不成立：
 
+```python
+# rag/llm.py:26 —— 权威实现本来就在 rag/
+def assess_context(retrieval_results, answerable_min=None, context_min=None):
+    top_relevance = max(relevance_of(r) for r in retrieval_results)
+    has_signal = any(has_relevance_signal(r) for r in retrieval_results)
+    if not has_signal:
+        return True, ..., top_relevance, len(context_parts)
+    if top_relevance < answerable_min:
+        return False, "", top_relevance, 0
 ```
-输入：检索结果列表
-输出：(can_answer: bool, reason: str, signals: dict)
-```
 
-`reason` 与 `signals` 是给面板展示的 —— 拒答时要说得出为什么，
-这正好对齐"禁止无声降级"。
+`chat_service.py:304-329` 是它的**手抄副本**（`relevance_of` /
+`top_relevance = max(...)` / `has_signal = any(...)` / 阈值比较，四部分
+逐一对应）。而 `chat_service.py:379` 又把 `answerable_min` 传进
+`answer_smart_stream` 让 `rag/` 再算一遍 —— **同一判断一次请求执行两次。**
 
-- **验收**：`rag/eval/` 能直接调用它跑可答性评测，不经过 `backend/`
+所以这不是位置漂移而是**副本漂移**，正确的动作是删副本而非搬家：
+
+- 删掉 `chat_service.py:304-329`，改调 `rag.llm.assess_context`
 - **验收**：`chat_service` 里不再出现 `ANSWERABLE_MIN_RELEVANCE`
-- **成本**：搬家部分约 1h，重做逻辑属 M3 本来的工作量
+- **验收**：架构测试禁止 `backend/services/` import 该常量
+- **成本**：约 0.5h（原估 1h）
+
+这个错误本身值得记下来：**诊断"规则放错了地方"之前，先确认它是不是
+已经在正确的地方存在一份。** 副本漂移与位置漂移的修法相反 ——
+前者删，后者搬 —— 搞反了会新建一个第三份实现。
+
+M3 重做 answerability 时（单一阈值已被 M1 证否），再考虑把
+`assess_context` 从 `llm.py` 抽成独立模块并让输出带上
+`reason` / `signals`（拒答时说得出为什么，对齐"禁止无声降级"）。
+那是 M3 本来的工作量，与本阶段无关。
 
 ### 阶段 2 · M3 的工具 Protocol（M3 内）
 

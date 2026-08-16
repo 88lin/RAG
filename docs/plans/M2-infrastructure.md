@@ -137,6 +137,120 @@ ingest_tasks(id uuid pk, filename text, size_bytes int, category text,
 
 ## 任务清单
 
+> **顺序**：T1 → T2 → T3 → **T0（插入）** → T5 → T4 → T6。
+> T0 是后加的架构收口，插在 T5 之前 —— 它修的三条正在产生错误输出，
+> 而它建立的机制会保护后面所有任务。
+
+### T0 · 架构收口（插入，约 4h）
+
+**为什么插队**：T3 完成后做了一次审计，发现五处规则漂移，其中一处
+**正在给用户看错误信息**。更重要的是，`CLAUDE.md` 里的架构约束一直只是
+文字，没有任何机制保障 —— 五处漂移全部发生在"约定存在但无人执行"的地方。
+
+遵循三条原则（2026 年 FastAPI 社区的实际共识，不是某个具名架构）：
+
+1. **依赖方向指向领域** —— 已基本满足（`rag/` 不 import `backend/`），
+   但 `backend/api/` 直接 import `rag/` 绕过了 service
+2. **I/O 集中在边缘** —— 检索路径已满足，**摄入与 `routes.py` 未满足**
+3. **用工具而非文档保障前两条** —— 完全缺失，这是本次最高杠杆的一项
+
+每格一个提交，**每个提交自洽、可回滚、测试全绿**。防漂移规则随对应修复
+一起加，不先写一批红灯测试再慢慢修。
+
+#### T0a · 阈值单一真相源（1h）
+
+同一个概念现在有四个值，且两个前端组件互相矛盾：
+
+| 位置 | 值 |
+|---|---|
+| `config.py:163` 默认值 | `0.50` |
+| `.env:35` 实际生效 | **`0.75`** |
+| `BrainPanel.vue:141-148` | `50`（注释声称"与后端 config 对齐"，已过期） |
+| `ChatPanel.vue:585,591` | `0.75` |
+
+后果：relevance = 0.60 时，仪表盘显示蓝色"足以支撑基于文档的回答"，
+同一次回答的引用卡片显示橙色，而后端按 0.75 判定**根本没用这些证据**。
+
+- 后端加 `GET /api/v1/config/thresholds`，返回 `{retrieval_min, answerable_min}`
+- 前端启动时拉一次，删除两个组件里的硬编码与过期注释
+- 统一 `config.py` 默认值与 `.env`（按 `docs/eval/threshold.md` 的校准结论定）
+- 架构测试：`frontend-vue/src/` 不得出现领域阈值字面量
+
+**验收**：改 `.env` 里的阈值，刷新页面后前端配色随之改变，无需改前端代码。
+
+#### T0b · 删可答性判断的副本（0.5h）
+
+`rag/llm.py:26 assess_context()` 是权威实现。`chat_service.py:304-329`
+是它的手抄副本 —— `relevance_of` / `top_relevance = max(...)` /
+`has_signal = any(...)` / 阈值比较，四部分逐一对应。
+
+更糟的是 `chat_service.py:379` 又把 `answerable_min` 传进
+`answer_smart_stream`，让 `rag/` 再算一遍。**同一判断一次请求执行两次。**
+
+- 删掉 service 里的副本，改调 `assess_context`
+- 架构测试：`backend/services/` 不得 import `ANSWERABLE_MIN_RELEVANCE`
+
+**验收**：`chat_service.py` 不再出现该常量；SSE 的可答性日志字段不变。
+
+#### T0c · I/O 边缘化（2h）
+
+"I/O 在边缘"有两层含义，本项目两层都缺：
+
+**第一层：阻塞调用不能跑在事件循环里。**
+
+| 位置 | 问题 |
+|---|---|
+| `upload.py:104` | `ingestion.ingest_file()` —— 解析+分块+embedding+写库全同步，**零 offload**，10MB 文件期间整个进程停摆 |
+| `upload.py:89,227` | `tempfile.NamedTemporaryFile().write()` 阻塞磁盘 I/O |
+| `upload.py:120,256` | `Path.unlink()` 阻塞 |
+| `routes.py:97,130,162,191` | `collection.get()` 同步，其中 `:97` 拉全库文档内容 |
+| `routes.py:205,232` | `collection.delete()` / `count()` 同步 |
+| `routes.py:208`、`upload.py:147,267` | `invalidate_bm25_cache()` 同步 |
+
+**第二层：领域数据的变换不该发生在协议层。**
+
+- `routes.py:99-127` 有 60 行按文件分组 chunk 的逻辑 —— 换成 CLI 一字不变，
+  是应用逻辑不是 HTTP 逻辑
+- `routes.py:9` 直接 `from rag import VectorDB`，`routes.py:92,160,187,230`
+  **每个请求新建一次 `VectorDB()`**，重复初始化 ChromaDB 客户端
+- `routes.py:208` 通过 `get_chat_service().retriever.invalidate_bm25_cache()`
+  捅进 service 内部对象的内部方法
+
+**做法**：新建 `backend/services/document_service.py`，把文档的列举/取切片/
+删除/统计搬进去，`routes.py` 只做参数校验与响应组装。所有 ChromaDB 调用
+经 `asyncio.to_thread`。`VectorDB` 改为模块级单例。
+
+`upload.py` 的同步端点同样 offload；两个端点的临时文件读写也走线程。
+**注意流式端点还有一处内存问题**：`file_data` 把所有文件全量读进内存后
+才开始处理，10 个文件即 100MB 常驻 —— 一并改为逐个处理。
+
+- 架构测试：`backend/api/` 不得 import `rag`
+
+**验收**：上传 10MB 文件期间，另一个终端请求 `/health` 能在 1 秒内返回。
+
+#### T0d · 架构约束测试（1h，规则随 T0a-T0c 分批加入）
+
+`tests/test_architecture.py`，用 AST 静态检查，不依赖运行时：
+
+```
+rag/ 不得 import backend/                   （现已满足，钉住）
+backend/api/ 不得 import rag                （T0c 后满足）
+backend/repositories/ 不得出现 .commit()    （已有，从 test_repositories 迁入）
+backend/services/ 不得 import 领域阈值常量   （T0b 后满足）
+frontend-vue/src/ 不得出现领域阈值字面量     （T0a 后满足）
+```
+
+**这是本次最高杠杆的一项。** 前四条约束在 `CLAUDE.md` 里写了很久，
+五处漂移照样发生 —— **写在文档里的架构约束等于没有约束**。
+
+**验收**：故意在 `backend/api/routes.py` 加一行 `from rag import VectorDB`，
+`pytest tests/test_architecture.py` 必须失败。
+
+#### T0e · 文档更正（0.5h）
+
+- ADR-004 阶段 1 的描述写错了（说"搬家到 `rag/`"，实际是"删副本"）
+- STATUS.md 的「下一步」改为单一有序清单
+
 ### T1 · 依赖与容器（1h）
 
 - `docker-compose.yml` 加 `postgres:16-alpine` + `redis:7-alpine`
