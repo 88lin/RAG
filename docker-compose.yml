@@ -13,6 +13,16 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须在 .env 中设置}
       # 让容器内的时间戳与应用一致，避免排查轨迹时对不上表
       TZ: UTC
+    ports:
+      # **必须写 127.0.0.1:5432 而不是 5432:5432。**
+      # 后者绑到 0.0.0.0，把数据库暴露给整个局域网 —— 而且 Docker 是
+      # 直接写 iptables/WinNAT 规则的，会绕过宿主机防火墙，
+      # 你以为拦住了其实没有。绑回环后只有本机能连。
+      #
+      # 发布端口是为了本机开发：跑 alembic 迁移、用 psql 看表、
+      # 让本地起的 backend 连库。容器之间通信走 rag-network，
+      # 不依赖这一行 —— 纯生产部署可以整段删掉。
+      - "127.0.0.1:5432:5432"
     volumes:
       # 命名卷而非 bind mount：PG 的数据目录对权限敏感，
       # 挂宿主机目录在 Windows 上会因权限问题起不来
@@ -44,6 +54,10 @@ services:
       --maxmemory-policy allkeys-lru
       --save ""
       --appendonly no
+    ports:
+      # 同样只绑回环。Redis 默认无密码，暴露到公网会被扫描器几分钟内
+      # 接管（这是最常见的入侵途径之一），绑 127.0.0.1 是底线。
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
