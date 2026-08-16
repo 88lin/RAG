@@ -102,10 +102,9 @@ class StreamingIngestionAdapter:
             }
             logger.info(f"[摄入] 开始解析: {filename}")
 
-            # 读取文件内容
-            await asyncio.sleep(0)  # 让出控制权，避免阻塞事件循环
+            # 读文件是阻塞 I/O，扔进线程池
             try:
-                content = read_document_file(file_path_obj)
+                content = await asyncio.to_thread(read_document_file, file_path_obj)
             except UnicodeDecodeError as e:
                 logger.error(f"[摄入] 编码错误: {filename} - {e}")
                 yield {
@@ -134,9 +133,8 @@ class StreamingIngestionAdapter:
             }
             logger.info(f"[摄入] 开始分块: {filename}")
 
-            await asyncio.sleep(0)
-            # 调用结构感知切块（返回 [(text, metadata), ...] 对）
-            chunk_pairs = chunk_with_metadata(content)
+            # 分块是纯 CPU（正则 + jieba），大文件上不可忽略
+            chunk_pairs = await asyncio.to_thread(chunk_with_metadata, content)
             chunks = [pair[0] for pair in chunk_pairs]
             chunk_metas = [pair[1] for pair in chunk_pairs]
             chunk_count = len(chunks)
@@ -172,18 +170,24 @@ class StreamingIngestionAdapter:
             }
             logger.info(f"[摄入] 开始 Embedding: {filename} ({chunk_count} chunks)")
 
-            # 批量向量化（核心模块方法）
-            # 注意：实际的 encode 是批量操作，progress 是估算值
-            await asyncio.sleep(0)
-
-            # 分批处理，模拟进度（每批最多32个）
+            # 分批处理：批既是进度粒度，也是单次占用线程的时长上限
             batch_size = 32
             all_embeddings = []
             for i in range(0, chunk_count, batch_size):
                 batch_chunks = chunks[i:i + batch_size]
-                batch_embeddings = self.ingestion.embedder.encode_documents(
+
+                # **必须 to_thread。** encode_documents 是同步 CPU 计算
+                # （torch 前向传播），直接调会把事件循环占满整批时长，
+                # 期间所有其它请求 —— 包括别人的 SSE 流与 /health —— 全在等。
+                #
+                # 此处原先是 `await asyncio.sleep(0)` 加一行同步调用，
+                # 注释写着"让出控制权，避免阻塞事件循环"。那是无效的：
+                # sleep(0) 只在调用**之前**让出一次，紧随其后的同步计算
+                # 照样霸占循环。让出控制权不能使阻塞调用变成非阻塞。
+                batch_embeddings = await asyncio.to_thread(
+                    self.ingestion.embedder.encode_documents,
                     batch_chunks,
-                    to_list=True
+                    to_list=True,
                 )
                 all_embeddings.extend(batch_embeddings)
 
@@ -199,8 +203,6 @@ class StreamingIngestionAdapter:
                     }
                 }
                 logger.debug(f"[摄入] Embedding 进度: {current}/{chunk_count}")
-
-                await asyncio.sleep(0)  # 让出控制权
 
             embeddings = all_embeddings
 
@@ -220,8 +222,6 @@ class StreamingIngestionAdapter:
             }
             logger.info(f"[摄入] 开始存储: {filename}")
 
-            await asyncio.sleep(0)
-
             # 准备数据：base 元数据 + 每块的 header 元数据 + 定位元数据
             # doc_key / seq / total_chunks 与 ingestion.ingest_text 保持一致，
             # 两条摄入路径（同步、流式）写入的 metadata 结构必须相同。
@@ -239,14 +239,16 @@ class StreamingIngestionAdapter:
                 for i in range(chunk_count)
             ]
 
-            self.ingestion.vectordb.delete_by_file(filename)
-
-            # 调用核心模块的存储方法
-            self.ingestion.vectordb.add(
+            # 先删后插，两步都是阻塞 I/O。
+            # 这个顺序也是摄入幂等的来源：重复摄入同一文件不会留下旧切片，
+            # 最坏只是白算一次 embedding —— 移除分布式锁的依据就在这。
+            await asyncio.to_thread(self.ingestion.vectordb.delete_by_file, filename)
+            await asyncio.to_thread(
+                self.ingestion.vectordb.add,
                 ids=ids,
                 embeddings=embeddings,
                 documents=chunks,
-                metadatas=metadatas
+                metadatas=metadatas,
             )
 
             yield {
@@ -259,8 +261,7 @@ class StreamingIngestionAdapter:
             logger.info(f"[摄入] 存储完成: {filename}")
 
             # ========== 阶段 6: 索引更新 ==========
-            await asyncio.sleep(0)
-            total_docs = self.ingestion.vectordb.count()
+            total_docs = await asyncio.to_thread(self.ingestion.vectordb.count)
 
             yield {
                 "type": "indexing_done",
