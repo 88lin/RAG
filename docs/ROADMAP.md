@@ -152,6 +152,13 @@ route → direct_rag / clarify / agent
 "给定这些证据能否回答"、用 top1 与 top2 的分数差而非绝对值、
 引用校验前置。
 
+重做时**一并搬到 `rag/answerability.py`** —— 当前这段逻辑错放在
+`chat_service.py:304-329`，那是编排层，而判断"证据够不够"需要领域知识
+（relevance 口径、各方案分数分布、实测阈值），导致 `rag/eval/` 想复用
+就得抄一遍代码。归属判据与迁移方案见
+[ADR-004](decisions/ADR-004-layering-and-rule-placement.md) 阶段 1。
+输出要带 `reason` 与 `signals`：拒答时说得出为什么，对齐"禁止无声降级"。
+
 降级链：主模型 → 重试 1 次（指数退避 + jitter）→ 降级小模型 →
 仍失败则返回已检索到的证据 + 明确失败说明。绝不静默返回空。
 
@@ -198,6 +205,7 @@ SSE 断线恢复：客户端带 `Last-Event-ID`，服务端从 Redis Stream 补�
 | 缓存 | Redis，不作为事实来源 | 只放缓存/限流/取消信号/事件流 |
 | 检索融合 | RRF，无权重参数 | 两路分数量纲不同，加权相加无物理意义。见 [ADR-001](decisions/ADR-001-rrf-over-weighted-fusion.md) |
 | 工具幂等 | 拆成 run 内步骤键 + 跨 run 缓存键 | 一个字段塞两种语义会让全局键把合法的重复请求判成重复。唯一性交给数据库约束而非应用层"先查再写"。见 [ADR-003](decisions/ADR-003-tool-call-idempotency-key.md) |
+| 分层与端口 | 混合：只在 LLM、工具、可答性三处引入端口，其余保持直接依赖 | 多数外部依赖只有一个实现且已决定不换，为它们写 Protocol 得到的是"一个接口一个实现"的空抽象。但规则漂移已真实发生（可答性判断漂进了编排层），关键边界需要接口挡住。见 [ADR-004](decisions/ADR-004-layering-and-rule-placement.md) |
 | 评测数据 | T2Ranking + CRUD-RAG，不自己标注 | 规模、避免循环论证、可比性。见 [ADR-002](decisions/ADR-002-eval-dataset-choice.md) |
 | 指标实现 | 检索层自研，生成层用 Ragas | 确定性运算应可单测；语义判断才交给 LLM，且必须人工抽检报一致率 |
 

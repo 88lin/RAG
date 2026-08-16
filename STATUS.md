@@ -39,8 +39,8 @@ tool_calls，因为后两者不能脱离 run 存在。
 
 | # | 标准 | 状态 |
 |---|---|---|
-| C1 | `docker compose up` 起 4 服务且健康检查通过 | **部分** —— `docker compose config` 通过，4 服务解析正确、`depends_on` 全为 `service_healthy`；**实际起容器未验证** |
-| C2 | `alembic upgrade head` 建出全部表 | **通过** —— 11 表 + `alembic_version`，`alembic check` 无漂移，downgrade 也验过 |
+| C1 | `docker compose up` 起 4 服务且健康检查通过 | **部分** —— `postgres` 与 `redis` 已实测起来且 healthy；backend/frontend 镜像未构建（要装 torch，约 10-20 分钟，放 M5） |
+| C2 | `alembic upgrade head` 建出全部表 | **通过** —— SQLite 与 **PostgreSQL 上都实测过**，`alembic check` 均无漂移，downgrade 也验过 |
 | C3-C5 | runs/evidence 落库、重启后数据仍在 | 未开始（依赖 T3） |
 | C6-C7 | 限流存 Redis、Redis 停掉仍放行 | 未开始（T4 后半） |
 | C8-C9 | 异步上传、`kb_version` 自增 | 未开始（T6） |
@@ -98,6 +98,26 @@ T3 期间（`session.py::_apply_sqlite_pragmas`）：
    默认的 deferred 事务延迟申请写锁，两个事务各持读锁再同时升级即死锁，
    **`busy_timeout` 对此无效**（那是死锁不是繁忙）。需
    `journal_mode=WAL` + `busy_timeout` + **`BEGIN IMMEDIATE`**，三者缺一不可。
+
+## PostgreSQL 实测结果（"PG 特有行为未验证"已消除）
+
+`docker compose up -d postgres redis` 起容器后实测：
+
+- `alembic upgrade head` → `Context impl PostgresqlImpl` + **`transactional DDL`**
+  （SQLite 上是 `SQLiteImpl` + `non-transactional`），`alembic check` exit 0
+- `runs.id` = `bigint DEFAULT nextval('runs_id_seq')`，SQLite 上是 `INTEGER`
+  —— `with_variant` 两边都对
+- `created_at` = `timestamp with time zone`；`tool_calls.args` = **`jsonb`**
+  （不是 `json`），`JSONField` 的方言分支生效
+- Repository 读写往返全部正确：`total_ms=0` 未被吞、`created_at.tzinfo=UTC`、
+  预加载在 session 关闭后可用、JSONB 中文键往返、`relevance=0.0` 未变 NULL、
+  5 并发 `get_or_create` 只产生 1 行（SAVEPOINT 在 PG 上同样工作）
+
+**宿主机侧端口是 15432 不是 5432**：开发机上已装有本地 PostgreSQL
+（`postgres.exe` 作为系统服务占着 `0.0.0.0:5432`），容器绑 5432 会报
+"An attempt was made to access a socket in a way forbidden by its access
+permissions" 而起不来。换端口而非停服务，还顺带避免了**静默连错库** ——
+连接串写 `localhost:5432` 会连到本机那个 PG，表和数据全对不上且不报错。
 
 ## 环境坑（本轮新踩）
 
