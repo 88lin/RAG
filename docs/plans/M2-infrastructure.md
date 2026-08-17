@@ -192,59 +192,124 @@ ingest_tasks(id uuid pk, filename text, size_bytes int, category text,
 
 **验收**：`chat_service.py` 不再出现该常量；SSE 的可答性日志字段不变。
 
-#### T0c · I/O 边缘化（2h）
+#### T0c · I/O 边缘化（3h，拆成四个子提交）
 
-"I/O 在边缘"有两层含义，本项目两层都缺：
+"I/O 在边缘"有两层含义，本项目两层都缺。下面列出**全部**违规点，
+一处不漏；每个子提交独立可回滚。
 
-**第一层：阻塞调用不能跑在事件循环里。**
+**第一层违规：阻塞调用跑在事件循环里。**
 
-| 位置 | 问题 |
-|---|---|
-| `upload.py:104` | `ingestion.ingest_file()` —— 解析+分块+embedding+写库全同步，**零 offload**，10MB 文件期间整个进程停摆 |
-| `upload.py:89,227` | `tempfile.NamedTemporaryFile().write()` 阻塞磁盘 I/O |
-| `upload.py:120,256` | `Path.unlink()` 阻塞 |
-| `routes.py:97,130,162,191` | `collection.get()` 同步，其中 `:97` 拉全库文档内容 |
-| `routes.py:205,232` | `collection.delete()` / `count()` 同步 |
-| `routes.py:208`、`upload.py:147,267` | `invalidate_bm25_cache()` 同步 |
+`async def` 里的同步调用不会让出控制权，期间**整个进程**对所有请求失去
+响应 —— 包括 Docker 的健康检查，而健康检查超时会导致容器被重启。
 
-**第二层：领域数据的变换不该发生在协议层。**
+| 文件:行 | 调用 | 阻塞类型 | 严重度 |
+|---|---|---|---|
+| `upload.py:104` | `ingestion.ingest_file()` | 解析+分块+embedding+写库，**零 offload** | **最高** —— 10MB 文件期间进程停摆 |
+| `upload.py:89,227` | `NamedTemporaryFile().write()` | 磁盘 I/O | 中 |
+| `upload.py:120,256` | `Path.unlink()` | 磁盘 I/O | 低 |
+| `upload.py:147,267` | `invalidate_bm25_cache()` | 重建 BM25 索引 | 中 |
+| `upload.py:32` | `VectorDB()` / `Embedder()` | 首次调用加载模型 | 中 |
+| `routes.py:97` | `collection.get(include=[...,"documents"])` | **拉全库正文** | **高** —— 随语料线性增长 |
+| `routes.py:130,162,191` | `collection.get(...)` | ChromaDB 查询 | 中 |
+| `routes.py:205` | `collection.delete(ids=...)` | ChromaDB 写 | 中 |
+| `routes.py:232` | `collection.count()` | ChromaDB 查询 | 低 |
+| `routes.py:208` | `invalidate_bm25_cache()` | 重建 BM25 索引 | 中 |
+| `routes.py:92,160,187,230` | `VectorDB()` | **每请求新建客户端** | 中 |
 
-- `routes.py:99-127` 有 60 行按文件分组 chunk 的逻辑 —— 换成 CLI 一字不变，
-  是应用逻辑不是 HTTP 逻辑
-- `routes.py:9` 直接 `from rag import VectorDB`，`routes.py:92,160,187,230`
-  **每个请求新建一次 `VectorDB()`**，重复初始化 ChromaDB 客户端
-- `routes.py:208` 通过 `get_chat_service().retriever.invalidate_bm25_cache()`
-  捅进 service 内部对象的内部方法
+**第二层违规：领域数据的变换发生在协议层。**
 
-**做法**：新建 `backend/services/document_service.py`，把文档的列举/取切片/
-删除/统计搬进去，`routes.py` 只做参数校验与响应组装。所有 ChromaDB 调用
-经 `asyncio.to_thread`。`VectorDB` 改为模块级单例。
+协议层只该做两件事：把 HTTP 请求解析成参数、把结果组装成响应。
+数据怎么变换、从哪取、要不要缓存，都不是它的事。
 
-`upload.py` 的同步端点同样 offload；两个端点的临时文件读写也走线程。
-**注意流式端点还有一处内存问题**：`file_data` 把所有文件全量读进内存后
-才开始处理，10 个文件即 100MB 常驻 —— 一并改为逐个处理。
+| 文件:行 | 问题 | 判定依据 |
+|---|---|---|
+| `routes.py:99-127` | 60 行"按文件分组 chunk"逻辑 | 换成 CLI 一字不变 → 应用逻辑 |
+| `routes.py:132-147` | 另一份分组逻辑（`include_chunks=False` 分支） | 同上，且与上一条重复 |
+| `routes.py:9` | `from rag import VectorDB` | api 不该知道向量库存在 |
+| `routes.py:208` | `get_chat_service().retriever.invalidate_bm25_cache()` | 穿三层拿内部对象的内部方法 |
+| `upload.py:16` | `from rag import DocumentIngestion, VectorDB, Embedder` | 同 `routes.py:9` |
+| `upload.py:23,183-190` | 文件类型白名单 + 全量读入内存 | 白名单是领域规则；全量读入是资源策略 |
 
-- 架构测试：`backend/api/` 不得 import `rag`
+**第三层（附带发现）：资源与错误处理。**
 
-**验收**：上传 10MB 文件期间，另一个终端请求 `/health` 能在 1 秒内返回。
+- `upload.py:183-190` 把**所有**文件全量读进内存才开始处理。
+  注释说是为了"避免 SSE 生成器内文件句柄已关闭"—— 理由成立，
+  但 10 个 10MB 文件 = 100MB 常驻。改为逐个落临时盘再处理。
+- `upload.py:104` 的 `ingest_file` 抛异常时，`finally` 里的 `unlink`
+  会执行，但**临时文件在异常路径上仍可能残留**（写入一半时进程被杀）。
+  这属于已知限制，记录不修。
+- `routes.py` 六个端点各自 `try/except Exception` 后 `raise HTTPException`，
+  与 `main.py` 的全局异常处理器重复。不在本次范围，记进待办观察。
+
+**子提交划分：**
+
+| # | 内容 | 验收 |
+|---|---|---|
+| c1 | 新建 `backend/services/document_service.py`：`VectorDB` 模块级单例 + 四个方法（`list_documents` / `get_chunks` / `delete_document` / `stats`），全部 `to_thread`，含分组逻辑 | 新增单测覆盖分组逻辑（含空库、单文件多 chunk、`include_chunks` 两分支） |
+| c2 | `routes.py` 改为调用 `DocumentService`，删掉 `from rag import VectorDB` 与两处分组逻辑 | 六个端点行为不变；文件从 245 行降到 ~120 行 |
+| c3 | `upload.py` 两个端点全部 offload，`get_ingestion()` 的初始化也走线程 | 上传 10MB 文件期间 `/health` 1 秒内返回 |
+| c4 | `upload.py` 流式端点改为逐文件处理，不再全量读入内存 | 10 个文件上传期间内存增量 < 20MB |
+
+**T0c 整体验收**：
+1. 上传 10MB 文件期间，另一个终端 `curl /health` 在 1 秒内返回
+2. `grep -rn "from rag import" backend/api/` 结果为空
+3. `grep -c "async def" backend/api/routes.py` 的每个端点体内无同步 ChromaDB 调用
+4. 228 条既有测试 + 新增 DocumentService 测试全绿
 
 #### T0d · 架构约束测试（1h，规则随 T0a-T0c 分批加入）
 
-`tests/test_architecture.py`，用 AST 静态检查，不依赖运行时：
+**这是本次最高杠杆的一项。** 前几条约束在 `CLAUDE.md` 里写了很久，
+五处漂移照样发生 —— **写在文档里的架构约束等于没有约束。**
 
-```
-rag/ 不得 import backend/                   （现已满足，钉住）
-backend/api/ 不得 import rag                （T0c 后满足）
-backend/repositories/ 不得出现 .commit()    （已有，从 test_repositories 迁入）
-backend/services/ 不得 import 领域阈值常量   （T0b 后满足）
-frontend-vue/src/ 不得出现领域阈值字面量     （T0a 后满足）
-```
+##### 为什么用 AST 而不是 import-linter
 
-**这是本次最高杠杆的一项。** 前四条约束在 `CLAUDE.md` 里写了很久，
-五处漂移照样发生 —— **写在文档里的架构约束等于没有约束**。
+| | `import-linter` | **AST（采纳）** |
+|---|---|---|
+| 依赖 | 新增一个包 + `.importlinter` 配置文件 | 只用标准库 `ast` |
+| 能查 import | 是 | 是 |
+| 能查"不得出现 `.commit()`" | **不能** | 能 |
+| 能查前端 `.vue` 里的字面量 | **不能**（只认 Python） | 能（正则那一条） |
+| 能查"同步调用在 async def 里" | **不能** | 能（AST 遍历函数体） |
+| 失败信息 | 独立命令的输出 | 与 pytest 其余测试同一处 |
 
-**验收**：故意在 `backend/api/routes.py` 加一行 `from rag import VectorDB`，
-`pytest tests/test_architecture.py` 必须失败。
+本项目要守的五条里有三条超出了 import 图的范围，而 `import-linter` 只解决
+import 层次。为一条规则引入一个依赖 + 一份独立配置，另外三条还得再写
+AST —— 不如统一用 AST。**已有先例**：`test_repositories.py::TestNoCommit`
+的源码扫描就是这个思路，本次把它归并进来并扩大范围。
+
+用 `ast.parse` 而非正则扫 Python：正则会把注释、docstring、字符串里的
+`import rag` 当成真 import。前端 `.vue` 没有 Python AST 可用，那一条用正则
+但排除注释行。
+
+##### 五条规则
+
+| # | 规则 | 现状 | 满足时机 |
+|---|---|---|---|
+| 1 | `rag/` 不得 import `backend/` | **已满足** | 钉住（CLAUDE.md 硬约束） |
+| 2 | `backend/api/` 不得 import `rag` | 违反（`routes.py:9`、`upload.py:16`） | T0c |
+| 3 | `backend/repositories/` 不得出现 `.commit()` | 已满足 | 从 `test_repositories` 迁入 |
+| 4 | `backend/services/` 不得 import 领域阈值常量 | 违反（`chat_service.py:304`） | T0b |
+| 5 | `frontend-vue/src/` 不得出现领域阈值字面量 | 违反（两个 `.vue`） | T0a |
+
+**规则 4 的边界**：禁的是阈值常量（`ANSWERABLE_MIN_RELEVANCE` /
+`RETRIEVAL_MIN_RELEVANCE`）—— 它们是领域规则的参数，用它们意味着在
+service 层做领域判断。**不禁** service 层读 `config` 的其它值
+（如 `SESSION_TIMEOUT`），那些是应用配置。
+
+**规则 2 的例外**：`backend/api/` 可以 import `backend.schemas`
+（那是协议层自己的 DTO）。测试要能区分 `rag` 与 `backend.*`。
+
+##### 每条规则都要有"反向测试"
+
+只断言"当前代码合规"是不够的 —— 规则写错了（比如永远返回通过）
+也会绿。每条规则配一个用例：喂一段**故意违规的源码字符串**给检查函数，
+断言它**返回违规**。这样测试本身的有效性也被覆盖。
+
+**验收**：
+1. `pytest tests/test_architecture.py` 全绿
+2. 手工在 `backend/api/routes.py` 加一行 `from rag import VectorDB`，
+   测试**必须失败**并指出文件与行号；删掉后恢复绿
+3. 每条规则的反向测试都能捕获人造违规
 
 #### T0e · 文档更正（0.5h）
 

@@ -72,6 +72,33 @@ class DocumentListResponse(BaseModel):
     documents: List[DocumentInfo] = Field(..., description="文档列表")
     total: int = Field(..., description="总数")
 
+
+# ==================== 阈值配置 ====================
+
+class ThresholdConfig(BaseModel):
+    """相关性阈值。前端据此给分数配色与分档，**不再自己硬编码**。
+
+    此前两个 Vue 组件各自写死了一份，且值互不相同（50 与 0.75），
+    而后端实际生效的是第三个值 —— 同一个 relevance 在仪表盘显示蓝色
+    "足以支撑回答"、在引用卡片显示橙色，后端却判定为不可答。
+
+    跨进程的常量副本没有任何编译器会报警，唯一可靠的办法是只有一份、
+    运行时下发。
+    """
+
+    retrieval_min: float = Field(
+        ..., description="低于此相关性的片段不进 prompt 上下文", ge=0.0, le=1.0
+    )
+    answerable_min: float = Field(
+        ..., description="top1 低于此相关性则判定知识库无答案", ge=0.0, le=1.0
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"retrieval_min": 0.35, "answerable_min": 0.75}
+        }
+    }
+
 # ==================== 错误响应模型 ====================
 
 class ErrorDetail(BaseModel):

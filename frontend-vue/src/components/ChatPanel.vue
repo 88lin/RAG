@@ -304,6 +304,10 @@ import {
   highlightTerms,
   type HighlightPart,
 } from '@/utils/markdown';
+import { useThresholds } from '@/composables/useThresholds';
+
+// 阈值的唯一真相源是后端 config.py，启动时拉一次
+const { tierOf } = useThresholds();
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -575,22 +579,27 @@ const handleMarkdownHover = (event: MouseEvent, msg: Message) => {
 };
 
 /**
- * 相关性配色。阈值与后端 config 对齐：
- *   ANSWERABLE_MIN_RELEVANCE = 0.75  足以支撑基于文档的回答
- *   RETRIEVAL_MIN_RELEVANCE  = 0.35  可进上下文但不足以判定可答
- * 注意 0.75 这个值由评测校准得出（docs/eval/threshold.md），
- * 且报告已说明单一阈值只能识别约两成无答案查询。
+ * 相关性配色。**阈值从后端拉取，不在此处硬编码** ——
+ * 此前这里写死 0.75/0.35，BrainPanel 写死 0.50/0.35，两个组件对同一个
+ * relevance 给出不同颜色。
+ *
+ * 阈值本身由评测校准（docs/eval/threshold.md），且报告已说明单一阈值
+ * 只能识别约两成无答案查询，M3 会引入独立的 answerability 判断。
  */
 const relevanceColorClass = (relevance: number): string => {
-  if (relevance >= 0.75) return 'text-neon-blue';
-  if (relevance >= 0.35) return 'text-amber-400';
-  return 'text-red-400';
+  switch (tierOf(relevance)) {
+    case 'answerable': return 'text-neon-blue';
+    case 'context':    return 'text-amber-400';
+    default:           return 'text-red-400';
+  }
 };
 
 const relevanceBarClass = (relevance: number): string => {
-  if (relevance >= 0.75) return 'bg-neon-blue';
-  if (relevance >= 0.35) return 'bg-amber-400';
-  return 'bg-red-400';
+  switch (tierOf(relevance)) {
+    case 'answerable': return 'bg-neon-blue';
+    case 'context':    return 'bg-amber-400';
+    default:           return 'bg-red-400';
+  }
 };
 
 /** 标题写明这个百分比是什么量，而不是含糊的"相关性" */

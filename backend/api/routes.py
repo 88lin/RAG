@@ -3,13 +3,38 @@ REST API路由（非流式）
 """
 
 from fastapi import APIRouter, HTTPException, status
-from backend.schemas import QueryRequest, QueryResponse, DocumentListResponse, CitationInfo, DocumentInfo, ChunkInfo
+from backend.schemas import (
+    QueryRequest, QueryResponse, DocumentListResponse, CitationInfo,
+    DocumentInfo, ChunkInfo, ThresholdConfig,
+)
 from backend.services.chat_service import get_chat_service
 from rag.logger import get_logger
 from rag import VectorDB
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+
+@router.get("/config/thresholds", response_model=ThresholdConfig,
+            summary="获取相关性阈值")
+async def get_thresholds():
+    """相关性阈值，供前端配色与分档使用。
+
+    **为什么要有这个端点**：阈值是领域规则的参数，只能有一份。此前前端
+    两个组件各自硬编码了一份且值不同（`50` 与 `0.75`），而后端实际用的是
+    第三个值 —— 同一个 relevance 在仪表盘显示"足以支撑回答"、在引用卡片
+    显示警告色，后端却判定不可答。跨进程的常量副本没有编译器会管，
+    只能运行时下发。
+
+    不做鉴权也不缓存：这两个数不是秘密（README 里就写着），
+    而且前端每次启动只拉一次。
+    """
+    from config import ANSWERABLE_MIN_RELEVANCE, RETRIEVAL_MIN_RELEVANCE
+
+    return ThresholdConfig(
+        retrieval_min=RETRIEVAL_MIN_RELEVANCE,
+        answerable_min=ANSWERABLE_MIN_RELEVANCE,
+    )
 
 
 @router.post("/chat/message", response_model=QueryResponse, summary="发送对话消息（非流式）")

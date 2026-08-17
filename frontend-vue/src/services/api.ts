@@ -1,5 +1,7 @@
 import { API_BASE_URL } from '@/constants';
-import type { BackendChunkInfo, BackendDocumentListResponse, SSEEvent } from '@/types';
+import type {
+  BackendChunkInfo, BackendDocumentListResponse, SSEEvent, ThresholdConfig,
+} from '@/types';
 
 // API 服务类
 class ApiService {
@@ -7,6 +9,24 @@ class ApiService {
 
   constructor(baseUrl: string = API_BASE_URL) {
     this.baseUrl = baseUrl;
+  }
+
+  // ==================== 配置 API ====================
+
+  /**
+   * 获取相关性阈值。
+   *
+   * 阈值只能有一份，在后端 config.py。此前两个组件各自硬编码且值不同
+   * （50 与 0.75），而后端实际用第三个值 —— 同一个 relevance 在仪表盘
+   * 显示"足以支撑回答"、在引用卡片显示警告色，后端却判定不可答。
+   * 不要把返回值再抄成常量。
+   */
+  async getThresholds(): Promise<ThresholdConfig> {
+    const response = await fetch(`${this.baseUrl}/config/thresholds`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch thresholds: ${response.statusText}`);
+    }
+    return response.json();
   }
 
   // ==================== 文档管理 API ====================

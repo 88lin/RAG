@@ -121,3 +121,17 @@ export interface BackendDocumentListResponse {
   documents: BackendDocument[];
   total: number;
 }
+
+/**
+ * 相关性阈值，由 GET /config/thresholds 下发。
+ *
+ * **不要在前端硬编码这两个数。** 它们是领域规则的参数，唯一真相源是
+ * 后端 config.py。此前 BrainPanel 与 ChatPanel 各写死一份且值不同，
+ * 同一个 relevance 在两个组件里显示不同颜色，而后端用的是第三个值。
+ */
+export interface ThresholdConfig {
+  /** 低于此相关性的片段不进 prompt 上下文 */
+  retrieval_min: number;
+  /** top1 低于此相关性则判定知识库无答案 */
+  answerable_min: number;
+}

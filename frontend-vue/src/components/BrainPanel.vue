@@ -108,6 +108,7 @@
 import { ref, computed, watch, nextTick } from 'vue';
 import { Terminal, Code, ChevronDown, ChevronRight, Cpu } from 'lucide-vue-next';
 import type { LogEntry } from '@/types';
+import { useThresholds } from '@/composables/useThresholds';
 
 interface Props {
   logs: LogEntry[];
@@ -137,14 +138,17 @@ const relevanceCaption = computed(() => {
 // 进度弧长 = 157 * percent / 100
 const gaugeArcLength = computed(() => (157 * relevancePercent.value) / 100);
 
-// 阈值与后端 config 对齐：
-//   ANSWERABLE_MIN_RELEVANCE = 0.50 —— 低于此值判定知识库无答案
-//   RETRIEVAL_MIN_RELEVANCE  = 0.35 —— 低于此值不进 prompt 上下文
+// 阈值从后端拉取，**不在此处硬编码**。
+// 此前这里写死 50 / 35 并附注释"与后端 config 对齐" —— 而后端实际用的是
+// 0.75，注释在阈值被校准后就过期了，且 ChatPanel 写的是另一个值。
+const { tierOf } = useThresholds();
+
 const gaugeColor = computed(() => {
-  const p = relevancePercent.value;
-  if (p >= 50) return '#06b6d4'; // neon-blue：足以支撑基于文档的回答
-  if (p >= 35) return '#f59e0b'; // 橙色：可进上下文，但不足以判定可答
-  return '#ef4444';              // 红色：视为知识库无答案
+  switch (tierOf(props.currentRelevance)) {
+    case 'answerable':   return '#06b6d4'; // neon-blue：足以支撑基于文档的回答
+    case 'context':      return '#f59e0b'; // 橙色：可进上下文，但不足以判定可答
+    default:             return '#ef4444'; // 红色：视为知识库无答案
+  }
 });
 
 // 日志自动滚动到底部

@@ -157,10 +157,15 @@ TOP_K_RESULTS = get_int("TOP_K_RESULTS", 3)
 # （一处是 hybrid_score 下限，越大越好；一处是余弦距离上限，越小越好），
 # 导致任何基于它的指标都无法解释。现拆为两个语义明确的阈值。
 #
-# 初值为拍定值，M1 建立评测集后用数据校准（横轴阈值、纵轴无答案识别率
-# 与误拒率，取拐点）。
+# M1 已用 300 条 T2Ranking 校准（横轴阈值、纵轴无答案识别率与误拒率，
+# 取拐点），见 docs/eval/threshold.md。
+# **这两个默认值必须与 .env.example 一致**：不一致时，没有 .env 的环境
+# （CI、新克隆的机器）与开发机行为不同，而这种差异不会报错。
 RETRIEVAL_MIN_RELEVANCE = get_float("RETRIEVAL_MIN_RELEVANCE", 0.35)   # 低于此值不进 prompt 上下文
-ANSWERABLE_MIN_RELEVANCE = get_float("ANSWERABLE_MIN_RELEVANCE", 0.50)  # top1 低于此值判定知识库无答案
+# 0.75 是 M1 校准结论（docs/eval/threshold.md「建议」节）。
+# 此前默认值是拍定的 0.50 而 .env 写 0.75，两者不一致 ——
+# 校准做完只改了 .env，忘了同步这里。
+ANSWERABLE_MIN_RELEVANCE = get_float("ANSWERABLE_MIN_RELEVANCE", 0.75)  # top1 低于此值判定知识库无答案
 
 # RRF 融合平滑常数，见 rag/scoring.py
 RRF_K = get_int("RRF_K", 60)
