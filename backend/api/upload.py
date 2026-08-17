@@ -5,6 +5,8 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import List
+import asyncio
+import logging
 import tempfile
 from pathlib import Path
 import json
@@ -13,27 +15,37 @@ import json
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 from config import SUPPORTED_FILE_TYPES
-from rag import DocumentIngestion, VectorDB, Embedder
-from rag.logger import get_logger
 from backend.adapters import StreamingIngestionAdapter
+from backend.services.document_service import (
+    get_ingestion_async,
+    get_document_service,
+)
 
-logger = get_logger(__name__)
+# 用标准库 logging：协议层不 import rag（见 tests/test_architecture.py）
+logger = logging.getLogger(__name__)
 router = APIRouter()
 SUPPORTED_UPLOAD_TYPES = {ext.lower() for ext in SUPPORTED_FILE_TYPES}
 
-# 初始化摄入器（全局单例）
-_ingestion_instance = None
+def _write_temp_file(content: bytes, suffix: str) -> str:
+    """把上传内容落到临时文件，返回路径。阻塞，需 to_thread 调用。"""
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=suffix, delete=False) as fp:
+        fp.write(content)
+        return fp.name
 
-def get_ingestion():
-    """获取 DocumentIngestion 单例"""
-    global _ingestion_instance
-    if _ingestion_instance is None:
-        logger.info("初始化 DocumentIngestion...")
-        vectordb = VectorDB()
-        embedder = Embedder()
-        _ingestion_instance = DocumentIngestion(vectordb, embedder)
-        logger.info("DocumentIngestion 初始化完成")
-    return _ingestion_instance
+
+def _remove_temp_file(path: str) -> None:
+    """删除临时文件。阻塞，需 to_thread 调用。"""
+    Path(path).unlink(missing_ok=True)
+
+
+async def invalidate_retrieval_caches() -> None:
+    """文档变更后刷新检索侧缓存。
+
+    收敛到 service 一处，两个上传端点共用 —— 此前两处各写了一份
+    `get_chat_service().retriever.invalidate_bm25_cache()`，
+    从协议层穿三层去拿另一个 service 的内部对象的内部方法。
+    """
+    await get_document_service().invalidate_retrieval_caches()
 
 
 @router.post("/documents/upload", summary="上传文档（同步版本）")
@@ -51,7 +63,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
     """
     logger.info(f"收到上传请求：{len(files)} 个文件")
 
-    ingestion = get_ingestion()
+    ingestion = await get_ingestion_async()
 
     results = []
     total_chunks = 0
@@ -85,14 +97,8 @@ async def upload_documents(files: List[UploadFile] = File(...)):
                 results.append(file_result)
                 continue
 
-            # 保存到临时文件
-            with tempfile.NamedTemporaryFile(
-                mode='wb',
-                suffix=file_ext,
-                delete=False
-            ) as temp_file:
-                temp_file.write(content)
-                temp_path = temp_file.name
+            # 写临时文件是阻塞磁盘 I/O，扔进线程池
+            temp_path = await asyncio.to_thread(_write_temp_file, content, file_ext)
 
             logger.info(f"开始摄入文件：{file.filename} ({len(content)} bytes)")
 
@@ -101,10 +107,15 @@ async def upload_documents(files: List[UploadFile] = File(...)):
                 # 提取类别（从文件名或默认）
                 category = "uploaded"
 
-                chunk_count = ingestion.ingest_file(
+                # **必须 to_thread。** ingest_file 一口气做完解析、分块、
+                # embedding、写向量库，全是同步调用。直接在 async def 里跑
+                # 会把事件循环占满整个摄入时长 —— 10MB 文件期间所有请求
+                # （包括 /health）都在等，而健康检查超时会让容器被重启。
+                chunk_count = await asyncio.to_thread(
+                    ingestion.ingest_file,
                     temp_path,
                     category=category,
-                    original_filename=file.filename
+                    original_filename=file.filename,
                 )
 
                 file_result["chunks"] = chunk_count
@@ -116,8 +127,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
                 logger.info(f"✓ 文件摄入成功：{file.filename} ({chunk_count} chunks)")
 
             finally:
-                # 删除临时文件
-                Path(temp_path).unlink(missing_ok=True)
+                await asyncio.to_thread(_remove_temp_file, temp_path)
 
         except Exception as e:
             file_result["error"] = str(e)
@@ -140,13 +150,9 @@ async def upload_documents(files: List[UploadFile] = File(...)):
         f"生成 {total_chunks} 个 chunks"
     )
 
-    # 刷新 ChatService 中的 BM25 索引缓存
+    # 刷新检索侧缓存（BM25 索引按全库语料构建，新增文档后需重建）
     if success_count > 0:
-        try:
-            from backend.services.chat_service import get_chat_service
-            get_chat_service().retriever.invalidate_bm25_cache()
-        except Exception:
-            pass
+        await invalidate_retrieval_caches()
 
     return JSONResponse(
         status_code=status.HTTP_200_OK,
@@ -179,32 +185,52 @@ async def upload_documents_stream(files: List[UploadFile] = File(...)):
     """
     logger.info(f"收到 SSE 流式上传请求：{len(files)} 个文件")
 
-    # 在生成器外提前读取所有文件内容，避免 SSE 生成器内文件句柄已关闭
-    file_data = []
+    # 在生成器外把上传内容落到临时盘。
+    #
+    # 必须在生成器外做：`UploadFile` 的句柄在响应开始流式输出后就关了，
+    # 生成器里再 read() 会失败。
+    #
+    # **但不能像原先那样把全部内容读进内存再放进列表** ——
+    # 10 个 10MB 文件就是 100MB 常驻，且要等最后一个读完才开始处理。
+    # 改为逐个落临时盘，内存里只留路径与大小。
+    staged: List[dict] = []
     for file in files:
         content = await file.read()
-        file_data.append({
-            "filename": file.filename,
-            "content": content,
-            "ext": Path(file.filename).suffix.lower()
+        ext = Path(file.filename).suffix.lower()
+        size = len(content)
+
+        # 类型与大小在这里就判掉，不合格的不落盘 —— 免得为一个必然被
+        # 拒绝的 10MB 文件白写一次磁盘
+        if ext not in SUPPORTED_UPLOAD_TYPES or size > MAX_FILE_SIZE_BYTES:
+            staged.append({
+                "filename": file.filename, "ext": ext,
+                "size": size, "temp_path": None,
+            })
+            continue
+
+        temp_path = await asyncio.to_thread(_write_temp_file, content, ext)
+        staged.append({
+            "filename": file.filename, "ext": ext,
+            "size": size, "temp_path": temp_path,
         })
+        del content  # 及时释放，下一轮循环不叠加
 
     async def event_generator():
         """SSE 事件生成器"""
-        total_files = len(file_data)
+        total_files = len(staged)
         processed_count = 0
         failed_count = 0
 
         # 发送开始事件
         yield f"data: {json.dumps({'type': 'upload_start', 'data': {'total_files': total_files}})}\n\n"
 
-        ingestion = get_ingestion()
+        ingestion = await get_ingestion_async()
         adapter = StreamingIngestionAdapter(ingestion)
 
-        for file_index, fd in enumerate(file_data, 1):
+        for file_index, fd in enumerate(staged, 1):
             filename = fd["filename"]
-            content = fd["content"]
             file_ext = fd["ext"]
+            temp_path = fd["temp_path"]
 
             # 检查文件类型
             if file_ext not in SUPPORTED_UPLOAD_TYPES:
@@ -216,21 +242,14 @@ async def upload_documents_stream(files: List[UploadFile] = File(...)):
             # 处理文件内容
             try:
 
-                # 检查文件大小
-                if len(content) > MAX_FILE_SIZE_BYTES:
-                    logger.warning(f"拒绝过大文件：{filename} ({len(content)} bytes)")
-                    yield f"data: {json.dumps({'type': 'error', 'data': {'filename': filename, 'stage': 'file_read', 'message': f'文件过大（{len(content)//1024}KB），上限 10MB'}})}\n\n"
+                # 检查文件大小（落盘阶段已判过，这里是它的对外表现）
+                size = fd["size"]
+                if size > MAX_FILE_SIZE_BYTES:
+                    logger.warning(f"拒绝过大文件：{filename} ({size} bytes)")
+                    message = f"文件过大（{size // 1024}KB），上限 10MB"
+                    yield f"data: {json.dumps({'type': 'error', 'data': {'filename': filename, 'stage': 'file_read', 'message': message}}, ensure_ascii=False)}\n\n"
                     failed_count += 1
                     continue
-
-                # 创建临时文件
-                with tempfile.NamedTemporaryFile(
-                    mode='wb',
-                    suffix=file_ext,
-                    delete=False
-                ) as temp_file:
-                    temp_file.write(content)
-                    temp_path = temp_file.name
 
                 logger.info(f"[{file_index}/{total_files}] 开始处理：{filename}")
 
@@ -252,21 +271,22 @@ async def upload_documents_stream(files: List[UploadFile] = File(...)):
                             failed_count += 1
 
                 finally:
-                    # 删除临时文件
-                    Path(temp_path).unlink(missing_ok=True)
+                    await asyncio.to_thread(_remove_temp_file, temp_path)
 
             except Exception as e:
                 logger.error(f"处理文件失败：{filename} - {e}", exc_info=True)
-                yield f"data: {json.dumps({'type': 'error', 'data': {'filename': filename, 'stage': 'file_read', 'message': str(e)}})}\n\n"
+                yield f"data: {json.dumps({'type': 'error', 'data': {'filename': filename, 'stage': 'file_read', 'message': str(e)}}, ensure_ascii=False)}\n\n"
                 failed_count += 1
 
-        # 上传完成后，刷新 ChatService 中的 BM25 索引缓存
+        # 兜底清理：客户端中途断开时 SSE 生成器会被中止，上面每个文件的
+        # finally 未必执行得到，已落盘但没处理的临时文件会残留。
+        for fd in staged:
+            if fd["temp_path"]:
+                await asyncio.to_thread(_remove_temp_file, fd["temp_path"])
+
+        # 刷新检索侧缓存（BM25 索引按全库语料构建，新增文档后需重建）
         if processed_count > 0:
-            try:
-                from backend.services.chat_service import get_chat_service
-                get_chat_service().retriever.invalidate_bm25_cache()
-            except Exception:
-                pass
+            await invalidate_retrieval_caches()
 
         # 发送所有文件处理完成事件
         yield f"data: {json.dumps({'type': 'all_complete', 'data': {'total': total_files, 'success': processed_count, 'failed': failed_count}})}\n\n"

@@ -3,13 +3,13 @@ SSE (Server-Sent Events) 流式接口
 """
 
 import json
+import logging
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from backend.services.chat_service import get_chat_service
 from backend.schemas import QueryRequest
-from rag.logger import get_logger
-
-logger = get_logger(__name__)
+# 用标准库 logging：协议层不 import rag（见 tests/test_architecture.py）
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 SSE_HEADERS = {

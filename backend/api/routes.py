@@ -1,17 +1,28 @@
-"""
-REST API路由（非流式）
+"""REST API 路由（非流式）
+
+**这一层只做协议的事**：解析请求参数、调用 service、组装响应。
+不碰 ChromaDB、不做数据变换、不 import `rag` —— 文档的列举/分组/删除
+都在 `services/document_service.py`。
+
+判据是"换成 CLI 还需不需要这段代码"：按文件分组 chunk 不需要 HTTP，
+所以它不属于这里。`tests/test_architecture.py` 会检查
+`backend/api/` 不得 import `rag`。
 """
 
-from fastapi import APIRouter, HTTPException, status
+import logging
+
+from fastapi import APIRouter, HTTPException
 from backend.schemas import (
     QueryRequest, QueryResponse, DocumentListResponse, CitationInfo,
     DocumentInfo, ChunkInfo, ThresholdConfig,
 )
 from backend.services.chat_service import get_chat_service
-from rag.logger import get_logger
-from rag import VectorDB
+from backend.services.document_service import get_document_service
 
-logger = get_logger(__name__)
+# 用标准库 logging 而非 rag.logger：协议层不 import rag。
+# 日志格式由 rag.logger 在应用启动时统一配置到 root logger，
+# 这里拿到的 logger 会继承那份配置。
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -105,96 +116,42 @@ async def clear_session(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== 文档 ====================
+#
+# 这四个端点原先直接持有 VectorDB、调 ChromaDB、并内联了两段
+# "按文件分组 chunk" 的逻辑（共约 60 行）。问题有三：
+#   1. 分组逻辑换成 CLI 一字不变，是应用逻辑不是 HTTP 逻辑
+#   2. 每个请求新建一次 VectorDB()，重复初始化客户端
+#   3. ChromaDB 的 Python 客户端是同步的，直接在 async def 里调
+#      会占住事件循环，其中列举文档那条还会拉全库正文
+# 现在全部收敛到 services/document_service.py，并 offload 到线程池。
+
+
 @router.get("/documents", response_model=DocumentListResponse, summary="获取文档列表")
 async def list_documents(include_chunks: bool = False):
-    """
-    获取文档列表
+    """获取文档列表。
 
-    Args:
-        include_chunks: 是否包含文档切片详情（默认 False）
+    `include_chunks=True` 会拉全库正文，代价随语料线性增长，
+    默认关闭 —— 前端按需再调 `/documents/{file}/chunks`。
     """
     try:
-        vectordb = VectorDB()
-        collection = vectordb.get_collection()
-
-        if include_chunks:
-            # 获取完整数据（包含文档内容）
-            results = collection.get(include=["metadatas", "documents"])
-
-            # 按文件分组整理 chunks
-            file_chunks_map = {}
-            ids = results.get("ids", [])
-            documents = results.get("documents", [])
-            metadatas = results.get("metadatas", [])
-
-            for i, (chunk_id, content, metadata) in enumerate(zip(ids, documents, metadatas)):
-                file = metadata.get("file", "unknown")
-                category = metadata.get("category", "unknown")
-
-                if file not in file_chunks_map:
-                    file_chunks_map[file] = {
-                        "file": file,
-                        "category": category,
-                        "chunks": []
-                    }
-
-                file_chunks_map[file]["chunks"].append(
-                    ChunkInfo(
-                        id=chunk_id,
-                        content=content,
-                        index=len(file_chunks_map[file]["chunks"])
-                    )
-                )
-
-            documents_list = [
-                DocumentInfo(**file_data)
-                for file_data in file_chunks_map.values()
-            ]
-        else:
-            # 只获取元数据（不含文档内容）
-            results = collection.get(include=["metadatas"])
-
-            documents_map = {}
-            for metadata in results.get("metadatas", []):
-                file = metadata.get("file", "unknown")
-                if file not in documents_map:
-                    documents_map[file] = {
-                        "file": file,
-                        "category": metadata.get("category", "unknown"),
-                        "chunks": None,
-                        "chunk_count": 0
-                    }
-                documents_map[file]["chunk_count"] += 1
-
-            documents_list = [
-                DocumentInfo(**document)
-                for document in documents_map.values()
-            ]
-
-        return DocumentListResponse(documents=documents_list, total=len(documents_list))
-
+        documents = await get_document_service().list_documents(include_chunks)
+        return DocumentListResponse(
+            documents=[DocumentInfo(**d) for d in documents],
+            total=len(documents),
+        )
     except Exception as e:
         logger.error(f"获取文档列表错误: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/documents/{file_name:path}/chunks", response_model=list[ChunkInfo], summary="获取文档切片")
+@router.get("/documents/{file_name:path}/chunks", response_model=list[ChunkInfo],
+            summary="获取文档切片")
 async def get_document_chunks(file_name: str):
     """按需获取指定文档的切片内容。"""
     try:
-        vectordb = VectorDB()
-        collection = vectordb.get_collection()
-        results = collection.get(
-            where={"file": file_name},
-            include=["documents", "metadatas"]
-        )
-
-        ids = results.get("ids", []) or []
-        documents = results.get("documents", []) or []
-        return [
-            ChunkInfo(id=chunk_id, content=content or "", index=index)
-            for index, (chunk_id, content) in enumerate(zip(ids, documents))
-        ]
+        chunks = await get_document_service().get_chunks(file_name)
+        return [ChunkInfo(**c) for c in chunks]
     except Exception as e:
         logger.error(f"获取文档切片错误: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -202,46 +159,21 @@ async def get_document_chunks(file_name: str):
 
 @router.delete("/documents/{file_name:path}", summary="删除指定文档")
 async def delete_document(file_name: str):
-    """
-    删除指定文档的所有切片
+    """删除指定文档的所有切片。
 
-    Args:
-        file_name: 文件名（可能包含路径，如 "policies/pet_policy.md"）
+    service 返回删除数量而非抛异常，**404 在这里判** ——
+    HTTP 状态码是协议层的事，service 抛 HTTPException 会让
+    CLI 调用方也得去 catch 一个 HTTP 异常。
     """
     try:
-        vectordb = VectorDB()
-        collection = vectordb.get_collection()
-
-        # 获取该文件的所有 chunk IDs
-        results = collection.get(
-            where={"file": file_name},
-            include=["metadatas"]
-        )
-
-        chunk_ids = results.get("ids", [])
-
-        if not chunk_ids:
-            raise HTTPException(
-                status_code=404,
-                detail=f"文档 '{file_name}' 不存在"
-            )
-
-        # 删除所有相关 chunks
-        collection.delete(ids=chunk_ids)
-
-        try:
-            get_chat_service().retriever.invalidate_bm25_cache()
-        except Exception:
-            logger.debug("刷新 BM25 缓存失败，忽略并继续", exc_info=True)
-
-        logger.info(f"已删除文档: {file_name}, 共 {len(chunk_ids)} 个切片")
-
+        deleted = await get_document_service().delete_document(file_name)
+        if deleted == 0:
+            raise HTTPException(status_code=404, detail=f"文档 '{file_name}' 不存在")
         return {
-            "message": f"文档已删除",
+            "message": "文档已删除",
             "file": file_name,
-            "chunks_deleted": len(chunk_ids)
+            "chunks_deleted": deleted,
         }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -252,19 +184,11 @@ async def delete_document(file_name: str):
 @router.get("/stats", summary="获取系统统计")
 async def get_stats():
     try:
-        vectordb = VectorDB()
-        collection = vectordb.get_collection()
-        count = collection.count()
-
-        chat_service = get_chat_service()
-        active_sessions = len(chat_service.sessions)
-
+        stats = await get_document_service().stats()
         return {
-            "total_chunks": count,
-            "active_sessions": active_sessions,
-            "vectordb_name": collection.name
+            **stats,
+            "active_sessions": len(get_chat_service().sessions),
         }
-
     except Exception as e:
         logger.error(f"获取统计错误: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
