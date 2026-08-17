@@ -13,8 +13,11 @@ from datetime import datetime
 
 from rag import Retriever, LLMClient, VectorDB, Embedder
 from rag.conversation import ConversationManager, ReferenceResolver
+from rag.llm import assess_context
 from rag.logger import get_logger
-from rag.scoring import compute_relevance, has_relevance_signal
+# compute_relevance 仍用于给引用卡片补展示字段（检索层没给 relevance 时）。
+# has_relevance_signal 不再在此处使用 —— 可答性判断已交回 assess_context。
+from rag.scoring import compute_relevance
 
 logger = get_logger(__name__)
 
@@ -297,41 +300,22 @@ class ChatService:
             citations = []
             full_prompt = ""  # 用于 Prompt Inspector
 
-            # 判断检索证据是否足以支撑基于文档的回答。
-            # 口径统一为 relevance ∈ [0,1] 越大越相关，不再按检索模式分叉 ——
-            # 此前 hybrid 与 vector 两个分支把同一个 SIMILARITY_THRESHOLD
-            # 当作方向相反的两种物理量。
-            from config import ANSWERABLE_MIN_RELEVANCE
-
-            top_relevance = None
-            # 是否有任何一条结果带可解释的相关性信息。
-            # 纯 BM25 检索没有（BM25 分数无界，无自然的 [0,1] 映射），
-            # 此时全部 relevance 为 0.0，若照常比阈值会拒绝所有查询 ——
-            # 实测纯 bm25 方案 Recall@5=0.586，排序是对的，不该被拒。
-            has_signal = any(has_relevance_signal(r) for r in results) if results else False
-
-            if results:
-                top_relevance = max(
-                    (
-                        r['relevance'] if isinstance(r.get('relevance'), (int, float))
-                        else compute_relevance(r)
-                    )
-                    for r in results
-                )
-
-            if not results:
-                should_use_context = False
-            elif not has_signal:
-                # 无相关性信息时退化为"有结果就用" —— 由检索层的排序负责质量，
-                # 不做无依据的阈值判断。
-                should_use_context = True
-            else:
-                should_use_context = top_relevance >= ANSWERABLE_MIN_RELEVANCE
+            # 可答性判断由 rag.llm.assess_context 负责 —— 那是唯一实现。
+            #
+            # 此前这里有一份手抄副本（relevance_of / top_relevance = max(...) /
+            # has_signal = any(...) / 阈值比较，四部分与 assess_context 逐一
+            # 对应），而下面的 answer_smart_stream 又会让 rag/ 再算一遍，
+            # 同一判断一次请求执行两次。
+            #
+            # 判断"证据够不够"需要领域知识（relevance 口径、各检索方案的
+            # 分数分布、M1 实测校准的阈值），属于 rag/ 而非编排层。
+            # 编排层只消费结论：决定走引用模式还是智能模式。
+            should_use_context, _, top_relevance, _ = assess_context(results)
 
             logger.info(
-                f"[{session_id}] 可答性检查: has_signal={has_signal}, top_relevance="
+                f"[{session_id}] 可答性检查: top_relevance="
                 f"{'None' if top_relevance is None else f'{top_relevance:.3f}'}, "
-                f"min={ANSWERABLE_MIN_RELEVANCE}, use_context={should_use_context}"
+                f"use_context={should_use_context}"
             )
 
             # 如果有高质量检索结果且启用引用，使用引用模式
@@ -372,11 +356,13 @@ class ChatService:
             else:
                 # 使用智能模式（混合式RAG：有好结果用文档，无结果或差结果用通用知识）
                 logger.info(f"[{session_id}] 使用智能模式（混合式RAG）")
+                # 不传 answerable_min：answer_smart_stream 内部同样调
+                # assess_context，其默认值就是 config 里那个。编排层把阈值
+                # 读出来再传进去，只是给"两处不一致"制造机会。
                 async for chunk in _sync_generator_to_async(
                     lambda: self.llm.answer_smart_stream(
                         resolved_question,
                         results,
-                        answerable_min=ANSWERABLE_MIN_RELEVANCE,
                         conversation_context=conversation_context
                     )
                 ):
