@@ -784,19 +784,9 @@ class TestNoCommit:
                 )).scalar_one()
                 assert count == 0, f"{model.__tablename__} 有残留"
 
-    @pytest.mark.asyncio
-    async def test_no_commit_call_in_source(self):
-        """源码级检查：Repository 里不该出现 session.commit()。
-
-        行为测试能发现大部分情况，但如果有人在一个罕见分支里 commit，
-        行为测试未必覆盖得到。这条直接读源码。
-        """
-        from pathlib import Path
-
-        repo_dir = Path(__file__).resolve().parent.parent / "backend" / "repositories"
-        offenders = [
-            path.name
-            for path in repo_dir.glob("*.py")
-            if ".commit()" in path.read_text(encoding="utf-8")
-        ]
-        assert not offenders, f"这些文件里有 commit(): {offenders}"
+    # 源码级的 commit 检查已迁到 tests/test_architecture.py::
+    # TestRepositoriesDoNotCommit，并从字符串查找改为 AST ——
+    # 原先的 `".commit()" in source` 会把注释和 docstring 里提到
+    # "不 commit" 的文字也算成违规。上面两条行为测试保留：
+    # 它们验的是"跨表原子性成立"，与"源码里没有 commit 调用"是
+    # 两个不同层面的证据。
