@@ -10,6 +10,7 @@ import queue
 import threading
 from typing import Dict, AsyncIterator, List, Optional
 from datetime import datetime
+import time
 
 from rag import Retriever, LLMClient, VectorDB, Embedder
 from rag.conversation import ConversationManager, ReferenceResolver
@@ -20,6 +21,96 @@ from rag.logger import get_logger
 from rag.scoring import compute_relevance
 
 logger = get_logger(__name__)
+
+
+async def _persist_run_async(
+    *,
+    session_id: str,
+    query: str,
+    route: str,
+    results: List[Dict],
+    full_answer: str,
+    citations: List[Dict],
+    total_ms: int,
+    first_token_ms: Optional[int],
+) -> None:
+    """一次 Q&A 结束后落库：session + run + evidence + 两条 message。
+
+    失败只记日志，不抛异常 —— SSE 流不能因为落库问题中断。
+    所有写入在同一个 session_scope() 事务里：要么全提交，要么全回滚。
+    没有部分成功的状态。
+
+    **调用时机**：在 `done` 事件 yield 之前。此时 full_answer 已完整累积，
+    citations 已抽取，results 已固定。
+    """
+    # 延迟导入：避免模块加载时循环依赖（session_scope 导入 config，
+    # config 在测试里可能比 chat_service 更早被 mock）
+    from backend.db.session import session_scope
+    from backend.repositories import (
+        EvidenceRepository,
+        RunRepository,
+        SessionRepository,
+    )
+
+    try:
+        async with session_scope() as db:
+            session_repo = SessionRepository(db)
+            run_repo = RunRepository(db)
+            evidence_repo = EvidenceRepository(db)
+
+            # 1. 确保 Session 行存在（并发安全的 get-or-create）
+            await session_repo.get_or_create(session_id)
+
+            # 2. 建 Run 行，拿到自增 id
+            run = await run_repo.create(
+                query=query,
+                session_id=session_id,
+                route=route,
+            )
+
+            # 3. 批量写证据。bulk_insert 要求 chunk_id 字段名，
+            #    而检索层的结果用 'id'；在这里做一次字段映射，
+            #    不改 EvidenceRepository 的接口契约。
+            normed = [
+                {
+                    "chunk_id": r.get("id", ""),
+                    "file": r.get("metadata", {}).get("file"),
+                    "relevance": r.get("relevance"),
+                    "retrieved_by": r.get("retrieved_by"),
+                }
+                for r in results
+            ]
+            evidence_rows = await evidence_repo.bulk_insert(run.id, normed)
+
+            # 4. 把答案实际引用的 chunk 标记为 used_in_answer=True
+            cited_ids = [c["chunk_id"] for c in citations if c.get("chunk_id")]
+            if cited_ids:
+                await evidence_repo.mark_used(run.id, cited_ids)
+
+            # 5. 写用户消息与助手消息，顺带刷新 session.last_active_at
+            await session_repo.append_message(
+                session_id,
+                role="user",
+                content=query,
+            )
+            await session_repo.append_message(
+                session_id,
+                role="assistant",
+                content=full_answer,
+                run_id=run.id,
+            )
+
+            # 6. 收尾：把 run 标为 ok 并记录耗时
+            await run_repo.finish(
+                run.id,
+                status="ok",
+                total_ms=total_ms,
+                first_token_ms=first_token_ms,
+            )
+
+    except Exception:
+        # 只记日志，不向上抛。落库失败不能让用户已收到的回答消失。
+        logger.warning("run 落库失败（session=%s），对话不受影响", session_id, exc_info=True)
 
 
 async def _sync_generator_to_async(sync_gen_factory) -> AsyncIterator:
@@ -128,6 +219,13 @@ class ChatService:
         resolver = self.resolvers[session_id]
 
         yield {"type": "connected", "data": {"session_id": session_id}}
+
+        # 计时与落库所需的上下文变量。
+        # 放在 try 外面，这样即使 try 内部分支赋值，finally / 落库代码都能拿到。
+        _t0: float = time.monotonic()
+        _first_token_time: Optional[float] = None
+        _route: str = "smart"   # citation | smart，在分支决策时更新
+        citations: List[Dict] = []  # 引用模式下会被 _citations 内部事件填充
 
         try:
             # 1. 指代消解
@@ -297,7 +395,6 @@ class ChatService:
 
             conversation_context = conversation.get_context_for_llm(max_turns=4)
             full_answer = ""
-            citations = []
             full_prompt = ""  # 用于 Prompt Inspector
 
             # 可答性判断由 rag.llm.assess_context 负责 —— 那是唯一实现。
@@ -320,10 +417,13 @@ class ChatService:
 
             # 如果有高质量检索结果且启用引用，使用引用模式
             if enable_citation and should_use_context:
+                _route = "citation"
                 async for event in self._stream_with_citations(
                     resolved_question, results, conversation_context
                 ):
                     if event["type"] == "answer_chunk":
+                        if _first_token_time is None:
+                            _first_token_time = time.monotonic()
                         full_answer += event["data"]["content"]
                     elif event["type"] == "_citations":
                         citations = event["data"]
@@ -349,12 +449,15 @@ class ChatService:
                     fallback_text = (fallback_text or "").strip()
 
                     if fallback_text:
+                        if _first_token_time is None:
+                            _first_token_time = time.monotonic()
                         full_answer = fallback_text
                         yield {"type": "answer_chunk", "data": {"content": fallback_text}}
                     else:
                         raise RuntimeError("LLM 生成完成，但返回内容为空，请检查当前模型配置。")
             else:
                 # 使用智能模式（混合式RAG：有好结果用文档，无结果或差结果用通用知识）
+                _route = "smart"
                 logger.info(f"[{session_id}] 使用智能模式（混合式RAG）")
                 # 不传 answerable_min：answer_smart_stream 内部同样调
                 # assess_context，其默认值就是 config 里那个。编排层把阈值
@@ -373,6 +476,8 @@ class ChatService:
                         logger.info(f"[{session_id}] 智能模式: {metadata.get('mode')} - {metadata.get('reason')}")
                         continue
 
+                    if _first_token_time is None:
+                        _first_token_time = time.monotonic()
                     full_answer += chunk
                     yield {"type": "answer_chunk", "data": {"content": chunk}}
 
@@ -381,6 +486,25 @@ class ChatService:
             conversation.add_assistant_message(full_answer)
             logger.info(f"[{session_id}] 回答完成，长度: {len(full_answer)}")
             logger.info(f"[{session_id}] [DEBUG] 发送done事件，full_prompt长度: {len(full_prompt)}")
+
+            # 5. 异步落库（session / run / evidence / messages）。
+            #    失败只记日志，不中断 SSE 流 —— 用户已收到的回答不能因此丢失。
+            total_ms = int((time.monotonic() - _t0) * 1000)
+            first_token_ms = (
+                int((_first_token_time - _t0) * 1000)
+                if _first_token_time is not None
+                else None
+            )
+            await _persist_run_async(
+                session_id=session_id,
+                query=question,
+                route=_route,
+                results=results,
+                full_answer=full_answer,
+                citations=citations,
+                total_ms=total_ms,
+                first_token_ms=first_token_ms,
+            )
 
             yield {"type": "done", "data": {"success": True, "full_prompt": full_prompt}}
 
