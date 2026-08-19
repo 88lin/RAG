@@ -1,4 +1,4 @@
-# 交接文档 — 2026-08-18
+# 交接文档 — 2026-08-19
 
 > 覆写此文件时用 `docs/handoffs/LATEST.md`，旧内容不保留。
 > 事实来源：代码与 `git log`；本文件仅导航。
@@ -7,47 +7,55 @@
 
 ### T5 会话落库 + run 轨迹落库（commit `786dec3`）
 
-**验收标准 C3/C4/C5 全部满足：**
+验收标准 C3/C4/C5 全部满足：
+- [backend/services/chat_service.py](../../backend/services/chat_service.py) 新增 `_persist_run_async`，在 `done` 事件前调用
+- 一个事务写完 sessions / runs / evidence / messages 四张表
+- 6 条新测试，全部通过
 
-- C3：一次问答结束后 `runs` 表有一行 status=ok，含 route/total_ms/first_token_ms
-- C4：`evidence` 表记录全部检索结果，答案实际引用的 chunk 标记 used_in_answer=True
-- C5：`messages` 表有 user/assistant 两条记录，新事务仍可读（模拟重启）
+### T4 限流迁移 + 缓存防御（commit `374bb75`）
 
-**核心改动只有两处：**
+三个已知问题全部修复：
 
-1. [backend/services/chat_service.py](../../backend/services/chat_service.py) — 新增模块级函数 `_persist_run_async`（第 26-113 行），以及在 `answer_stream` 里添加计时变量和落库调用（第 223-507 行附近）。
-2. [tests/test_chat_persistence.py](../../tests/test_chat_persistence.py) — 6 条新测试。
+1. Redis 优先 + 内存降级：[backend/rate_limit.py](../../backend/rate_limit.py) 改用 INCR+EXPIRE 滑动窗口，Redis 不可用时自动切本地内存，不拒绝流量
+2. 内存有界：`defaultdict` 改 `OrderedDict`，上限 10000 IP，超出 FIFO 淘汰
+3. XFF 校验：只有来自 `TRUSTED_PROXY_IPS` 的 TCP 对端才采信 x-forwarded-for
 
-**290 passed，`vue-tsc` exit 0。**
+[config.py](../../config.py) 新增两个配置项：`RATE_LIMIT_WINDOW_SECONDS`（默认 60）、`TRUSTED_PROXY_IPS`（默认空列表）
+
+11 条新测试，**301 passed total**。
 
 ## 当前状态
 
-**已完成**：T1、T2、T3、T0（五处规则漂移）、T5  
-**待做（按顺序）**：T4 限流迁移 + 缓存防御 → T6 异步摄入 → M2 完成  
+**已完成**：T1、T2、T3、T0（五处规则漂移）、T5、T4
+
+**待做（按顺序）**：T6 异步摄入 → M2 完成
 
 详见 [STATUS.md](../../STATUS.md)。
 
-## 下一格：T4 限流迁移 + 缓存防御
+## 下一格：T6 异步摄入
 
-涉及三个已知问题（在 STATUS.md 待办观察里有详细描述）：
+目标：上传 5MB PDF 立即返回 task_id，不阻塞请求。
 
-1. `rate_limit.py` 内存态 → Redis（重启归零、多副本翻倍）
-2. `request_history` 无界增长（每个 IP 建一个 deque 且永不清理）
-3. `x-forwarded-for` 无条件信任（可被伪造绕过限流）
+基础设施已就绪：
+- `IngestTaskRepository` — pending/running/done/error 状态机，CAS 防双认领
+- `backend/cache/redis_client.py` — `hset_mapping`/`hgetall` 可用于进度写入
+- `upload.py` 两个端点的所有阻塞调用已 offload（T0c）
 
-`backend/cache/redis_client.py` 已有，有 41 条测试；`rate_limit.py` 还是内存态。
+需要做的：
+1. 新建 `/api/v1/documents/upload/async` 端点，接收文件后写 `ingest_tasks` 行、把实际摄入扔进 `asyncio.create_task` / BackgroundTasks，立即返回 task_id
+2. 新建 `/api/v1/documents/tasks/{task_id}` 查询端点，从 DB 读状态
+3. 进度（embedding_progress 等）写 Redis hash（key = `ingest:{task_id}`，TTL = 1h），前端用 SSE 或轮询读
 
-## 关键架构决策（本次新增）
+## T4 关键设计决策
 
-`_persist_run_async` 选择在 `done` 事件 yield **前**落库，而非 yield 后：
+**为什么用固定窗口（INCR+EXPIRE）而非 sorted-set 滑动窗口**：
 
-- yield 后落库：用户端 SSE 连接已关，任何异常都只能打日志，但落库操作的时序不可预测（`asyncio.to_thread` 的调度）
-- yield 前落库：保证"用户看到 done → 数据已在库里"，且异常仍只打日志不影响 SSE
+固定窗口 2 条 Redis 命令；sorted-set 需要 ZADD + ZREMRANGEBYSCORE + ZCARD，写放大更大，TTL 管理更复杂。边界抖动（窗口末尾可能接受 2× 的请求）对这个场景可以接受。
 
-落库在一个 `session_scope()` 事务里：session → run → evidence → mark_used → messages × 2 → finish run。任何步骤失败整体回滚，不存在"run 行存在但 evidence 缺失"的半成功状态。
+**为什么内存降级用 FIFO 而非 LRU**：
 
-## 注意事项
+LRU 需要每次命中时更新顺序，与限流写路径耦合。FIFO 淘汰最旧插入的 IP，对扫描器场景足够：扫描器不会持续复用同一 IP，最旧的恰好是最不活跃的。
 
-- `_persist_run_async` 用延迟导入避免循环依赖（`session_scope` 的导入链在测试里会比 `chat_service` 先初始化）
-- `ChatService` 仍保留内存中的 `ConversationManager`（用于多轮对话上下文拼装），T5 不替换它；内存态与 DB 态并存，DB 是持久化副本
-- `first_token_ms=None` 存 NULL 而非 0：两者语义不同（未记录 vs 极快缓存命中）
+**XFF 安全默认**：
+
+`TRUSTED_PROXY_IPS` 默认空列表。新部署时不配置代理就不会意外信任伪造的 IP，需要时显式加入。
