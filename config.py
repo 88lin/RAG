@@ -92,6 +92,20 @@ CACHE_TTL_EMBEDDING = get_int("CACHE_TTL_EMBEDDING", 86400)
 # 限流：每 IP 每窗口允许的请求数
 RATE_LIMIT_PER_MINUTE = get_int("RATE_LIMIT_PER_MINUTE", 30)
 
+# 限流窗口长度（秒）。默认 60 秒与 RATE_LIMIT_PER_MINUTE 对应。
+# 改短窗口可以得到更平滑的限制（如 10s 内最多 5 次），不需要改 RATE_LIMIT_PER_MINUTE。
+RATE_LIMIT_WINDOW_SECONDS = get_int("RATE_LIMIT_WINDOW_SECONDS", 60)
+
+# 可信反向代理 IP 列表。只有来自这些 IP 的请求才会采信 x-forwarded-for。
+# 多个 IP 用逗号分隔，例：TRUSTED_PROXY_IPS=10.0.0.1,10.0.0.2
+# 默认空列表 = 不信任任何代理 = 直接用 TCP 连接 IP 限流（安全默认）。
+# 在 Nginx / k8s Ingress 后运行时，把代理节点 IP 加进来。
+TRUSTED_PROXY_IPS: list[str] = [
+    ip.strip()
+    for ip in os.getenv("TRUSTED_PROXY_IPS", "").split(",")
+    if ip.strip()
+]
+
 # ============================================================
 # Embedding 模型配置
 # ============================================================
